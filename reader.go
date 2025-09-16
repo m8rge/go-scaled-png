@@ -2,10 +2,10 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package png implements a PNG image decoder and encoder.
+// Package pngscaled implements a PNG image decoder that decodes and scale down image at same time.
 //
 // The PNG specification is at https://www.w3.org/TR/PNG/.
-package png
+package pngscaled
 
 import (
 	"compress/zlib"
@@ -621,6 +621,43 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 				}
 			}
 		case cbG8:
+			// Gray 8-bit, optional tRNS
+			if TargetWidth > 0 && TargetWidth < width && TargetFilter != nil {
+				dstW := TargetWidth
+				if d.useTransparent {
+					// Gray+tRNS -> NRGBA
+					t := d.transparent[1]
+					row := nrgba.Pix[pixOffset : pixOffset+nrgba.Stride]
+					// Resample gray into RGB, then set alpha from tRNS (post)
+					// We resample as 1 channel, then expand to RGBA in-place per pixel.
+					// For minimal changes, do direct 1->4 resampling with alpha filled to 255,
+					// then set 0 where gray == t.
+					resampleRowInto(row[:dstW*4], dstW, cdat, width, 1, 4, *TargetFilter, true, 0xff)
+					for x := 0; x < dstW; x++ {
+						i := x * 4
+						v := row[i+0] // R=G=B
+						if v == t {
+							row[i+3] = 0x00
+						}
+					}
+					for k := dstW * 4; k < nrgba.Rect.Dx()*4; k++ {
+						row[k] = 0
+					}
+					pixOffset += nrgba.Stride
+					break
+				} else {
+					// Pure gray -> gray
+					row := gray.Pix[pixOffset : pixOffset+gray.Stride]
+					resampleRowInto(row[:dstW], dstW, cdat, width, 1, 1, *TargetFilter, false, 0)
+					for k := dstW; k < gray.Rect.Dx(); k++ {
+						row[k] = 0
+					}
+					pixOffset += gray.Stride
+					break
+				}
+			}
+			// fall through to original cbG8 if no shrink/filter
+			// -------------------------------------------------------------------------------
 			if d.useTransparent {
 				ty := d.transparent[1]
 				for x := 0; x < width; x++ {
@@ -641,6 +678,45 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 				nrgba.SetNRGBA(x, y, color.NRGBA{ycol, ycol, ycol, cdat[2*x+1]})
 			}
 		case cbTC8:
+			// RGB 8-bit, optional tRNS -> write into RGBA/NRGBA.
+			if TargetWidth > 0 && TargetWidth < width && TargetFilter != nil {
+				dstW := TargetWidth
+				if d.useTransparent {
+					// tRNS => NRGBA, alpha=0 where RGB matches transparent key.
+					// Do it in two stages without alloc:
+					// 1) Resample RGB into left side of a temporary view (actually row), then
+					// 2) Post-process alpha from the resampled RGB values.
+					// To keep changes minimal, we do it in one pass by computing alpha after sample read.
+					tr, tg, tb := d.transparent[1], d.transparent[3], d.transparent[5]
+					row := nrgba.Pix[pixOffset : pixOffset+nrgba.Stride]
+					// Resample RGB channels:
+					resampleRowInto(row[:dstW*4], dstW, cdat, width, 3, 4, *TargetFilter, true, 0xff)
+					// Fix alpha using tRNS on the *resampled* RGB:
+					for x := 0; x < dstW; x++ {
+						i := x * 4
+						r, g, b := row[i+0], row[i+1], row[i+2]
+						if r == tr && g == tg && b == tb {
+							row[i+3] = 0x00
+						}
+					}
+					// Optional: zero right tail to visualize shrink
+					for k := dstW * 4; k < nrgba.Rect.Dx()*4; k++ {
+						row[k] = 0
+					}
+					pixOffset += nrgba.Stride
+					break
+				} else {
+					// RGB -> RGBA, constant alpha 255
+					row := rgba.Pix[pixOffset : pixOffset+rgba.Stride]
+					resampleRowInto(row[:dstW*4], dstW, cdat, width, 3, 4, *TargetFilter, true, 0xff)
+					for k := dstW * 4; k < rgba.Rect.Dx()*4; k++ {
+						row[k] = 0
+					}
+					pixOffset += rgba.Stride
+					break
+				}
+			}
+			// fall through to original cbTC8 if no shrink/filter
 			if d.useTransparent {
 				pix, i, j := nrgba.Pix, pixOffset, 0
 				tr, tg, tb := d.transparent[1], d.transparent[3], d.transparent[5]
@@ -719,6 +795,17 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 			copy(paletted.Pix[pixOffset:], cdat)
 			pixOffset += paletted.Stride
 		case cbTCA8:
+			if TargetWidth > 0 && TargetWidth < width && TargetFilter != nil {
+				row := nrgba.Pix[pixOffset : pixOffset+nrgba.Stride]
+				resampleRowRGBAIntoPremulNormalized(row[:TargetWidth*4], TargetWidth, cdat, width, *TargetFilter)
+				for k := TargetWidth * 4; k < nrgba.Rect.Dx()*4; k++ {
+					row[k] = 0
+				}
+				pixOffset += nrgba.Stride
+				break
+			}
+			// fall through to original cbTCA8...
+
 			copy(nrgba.Pix[pixOffset:], cdat)
 			pixOffset += nrgba.Stride
 		case cbG16:

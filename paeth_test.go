@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package png
+package pngscaled
 
 import (
 	"bytes"
@@ -83,7 +83,8 @@ func TestPaethDecode(t *testing.T) {
 			filterPaeth(cdat1, pdat1, bytesPerPixel)
 			slowFilterPaeth(cdat2, pdat2, bytesPerPixel)
 			if !bytes.Equal(cdat1, cdat2) {
-				t.Errorf("bytesPerPixel: %d\npdat0: % x\ncdat0: % x\ngot:   % x\nwant:  % x", bytesPerPixel, pdat0, cdat0, cdat1, cdat2)
+				t.Errorf("bytesPerPixel: %d\npdat0: % x\ncdat0: % x\ngot:   % x\nwant:  % x", bytesPerPixel, pdat0, cdat0, cdat1,
+					cdat2)
 				break
 			}
 		}
