@@ -3,6 +3,7 @@ package pngscaled
 import (
 	"image/png"
 	"os"
+	"runtime"
 	"testing"
 
 	"github.com/kovidgoyal/imaging"
@@ -13,8 +14,8 @@ func TestShrink(t *testing.T) {
 	TargetWidth = 400
 	UseImagingFilter(imaging.Lanczos.Support, imaging.Lanczos.Kernel)
 
-	names := []string{"1.png", "2.png"}
-	outNames := []string{"1-out.png", "2-out.png"}
+	names := []string{"1.png", "2.png", "3.png"}
+	outNames := []string{"1-out.png", "2-out.png", "3-out.png"}
 
 	for i, name := range names {
 		data, err := os.Open(name)
@@ -30,10 +31,11 @@ func TestShrink(t *testing.T) {
 }
 
 func BenchmarkShrink(b *testing.B) {
+	runtime.GOMAXPROCS(1)
 	TargetWidth = 400
 	UseImagingFilter(imaging.Lanczos.Support, imaging.Lanczos.Kernel)
 
-	names := []string{"1.png", "2.png"}
+	names := []string{"1.png"}
 	files := make([]*os.File, len(names))
 	for i, name := range names {
 		data, err := os.Open(name)
@@ -53,9 +55,10 @@ func BenchmarkShrink(b *testing.B) {
 }
 
 func BenchmarkShrinkInitial(b *testing.B) {
+	runtime.GOMAXPROCS(1)
 	TargetWidth = 0
 
-	names := []string{"1.png", "2.png"}
+	names := []string{"1.png"}
 	files := make([]*os.File, len(names))
 	for i, name := range names {
 		data, err := os.Open(name)
@@ -68,7 +71,7 @@ func BenchmarkShrinkInitial(b *testing.B) {
 		for _, file := range files {
 			file.Seek(0, 0)
 
-			image, err := png.Decode(file)
+			image, err := Decode(file)
 			require.NoError(b, err)
 			_ = imaging.Resize(image, 400, image.Bounds().Dy(), imaging.Lanczos)
 		}

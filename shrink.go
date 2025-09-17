@@ -1,6 +1,9 @@
 package pngscaled
 
-import "math"
+import (
+	"math"
+	"sync"
+)
 
 // --- Optional horizontal shrinking API (minimal-invasive) --------------------
 // TargetWidth enables optional horizontal shrinking during decode.
@@ -27,211 +30,262 @@ func UseImagingFilter(support float64, kernel func(float64) float64) {
 	TargetFilter = &Filter{Support: support, Kernel: kernel}
 }
 
-// resampleRowInto writes a horizontally resampled row into dst (no allocations).
-//   - dst must have room for dstW * chansOut bytes (we usually pass left part of Pix row).
-//   - src is a single de-filtered row: srcW * chansIn bytes.
-//   - If chansOut > chansIn (e.g. RGB->RGBA), alphaConst is used to fill the last channel
-//     when fillAlphaConst == true.
-//
-// Edge handling: clamp-to-edge (same as common imaging libraries).
-func resampleRowInto(
-	dst []byte, dstW int, src []byte, srcW, chansIn, chansOut int,
-	filter Filter, fillAlphaConst bool, alphaConst byte,
-) {
-	if dstW <= 0 || srcW <= 0 {
-		return
-	}
-	scale := float64(srcW) / float64(dstW)
-	support := filter.Support * scale
-	for x := 0; x < dstW; x++ {
-		center := (float64(x) + 0.5) * scale
-		left := int(math.Ceil(center - support))
-		right := int(math.Floor(center + support))
-		for c := 0; c < chansOut; c++ {
-			if c == chansOut-1 && fillAlphaConst && chansOut > chansIn {
-				dst[x*chansOut+c] = alphaConst
-				continue
-			}
-			srcC := c
-			if c >= chansIn {
-				srcC = chansIn - 1
-			} // safety
-			var sum float64
-			for i := left; i <= right; i++ {
-				ii := i
-				if ii < 0 {
-					ii = 0
-				} else if ii >= srcW {
-					ii = srcW - 1
-				}
-				// Distance in source pixel domain, normalized by scale:
-				w := filter.Kernel((float64(ii) + 0.5 - center) / scale)
-				sum += float64(src[ii*chansIn+srcC]) * w
-			}
-			if sum < 0 {
-				sum = 0
-			} else if sum > 255 {
-				sum = 255
-			}
-			dst[x*chansOut+c] = byte(sum + 0.5)
-		}
-	}
+// --- Coeff table -------------------------------------------------------------
+
+type coeffRow struct {
+	left int
+	w    []float32 // length == taps for this dst pixel (normalized)
 }
 
-// Filter and UseImagingFilter you already have.
+type coeffTable struct {
+	srcW, dstW int
+	filter     Filter
+	scale      float64
+	supportPx  int
+	rows       []coeffRow
+}
 
-// resampleRowIntoNormalized: normalized weights (sum to 1) for non-premultiplied data.
-// chansIn/out as before. No allocations.
-func resampleRowIntoNormalized(
-	dst []byte, dstW int, src []byte, srcW, chansIn, chansOut int,
-	filter Filter, fillAlphaConst bool, alphaConst byte,
-) {
-	if dstW <= 0 || srcW <= 0 {
-		return
+// Build once per (srcW,dstW,filter). Anti-aliasing: taps grow with shrink factor.
+func buildCoeffTable(srcW, dstW int, f Filter) *coeffTable {
+	ct := &coeffTable{
+		srcW: srcW, dstW: dstW, filter: f,
+		scale: float64(srcW) / float64(dstW),
 	}
-	scale := float64(srcW) / float64(dstW)
-	support := filter.Support * scale
-	for x := 0; x < dstW; x++ {
-		center := (float64(x) + 0.5) * scale
-		left := int(math.Ceil(center - support))
-		right := int(math.Floor(center + support))
+	// Effective support in *source* pixels
+	supp := f.Support * ct.scale
+	// Max taps per pixel ~ floor(2*supp)+1
+	maxTaps := int(math.Floor(2*supp)) + 1
+	if maxTaps < 1 {
+		maxTaps = 1
+	}
+	ct.supportPx = maxTaps
 
-		var sumW float64
-		ws := make([]float64, right-left+1) // tiny, per-pixel; if you want zero alloc, reuse a small stack buffer
-		idx := 0
-		for i := left; i <= right; i++ {
-			ii := i
-			if ii < 0 {
-				ii = 0
-			} else if ii >= srcW {
-				ii = srcW - 1
-			}
-			w := filter.Kernel((float64(ii) + 0.5 - center) / scale)
-			ws[idx] = w
-			sumW += w
-			idx++
+	ct.rows = make([]coeffRow, dstW)
+	for x := 0; x < dstW; x++ {
+		center := (float64(x) + 0.5) * ct.scale
+		left := int(math.Ceil(center - supp))
+		right := int(math.Floor(center + supp))
+		if left < 0 {
+			left = 0
 		}
-		if sumW == 0 {
-			// Fallback to nearest neighbor.
+		if right >= srcW {
+			right = srcW - 1
+		}
+		taps := right - left + 1
+		if taps < 1 {
+			taps = 1
+		}
+
+		// compute weights & normalize
+		w := make([]float32, taps)
+		var sum float64
+		for i := 0; i < taps; i++ {
+			// map tap index -> source pixel index
+			si := left + i
+			// normalized distance in source domain
+			dx := (float64(si) + 0.5 - center) / ct.scale
+			ww := f.Kernel(dx)
+			sum += ww
+			w[i] = float32(ww)
+		}
+		if sum == 0 {
+			// fallback to NN
+			for i := range w {
+				w[i] = 0
+			}
 			sx := int(center)
 			if sx < 0 {
 				sx = 0
 			} else if sx >= srcW {
 				sx = srcW - 1
 			}
-			copy(dst[x*chansOut:x*chansOut+min(chansOut, chansIn)], src[sx*chansIn:sx*chansIn+chansIn])
-			if fillAlphaConst && chansOut > chansIn {
-				dst[x*chansOut+chansOut-1] = alphaConst
+			left = sx
+			w = w[:1]
+			w[0] = 1
+		} else {
+			inv := float32(1.0 / sum)
+			for i := range w {
+				w[i] *= inv
 			}
-			continue
 		}
-		inv := 1.0 / sumW
+		ct.rows[x] = coeffRow{left: left, w: w}
+	}
+	return ct
+}
 
-		for c := 0; c < chansOut; c++ {
-			if c == chansOut-1 && fillAlphaConst && chansOut > chansIn {
-				dst[x*chansOut+c] = alphaConst
-				continue
-			}
-			srcC := c
-			if srcC >= chansIn {
-				srcC = chansIn - 1
-			}
-			var acc float64
-			for j := 0; j < len(ws); j++ {
-				i := left + j
-				if i < 0 {
-					i = 0
-				} else if i >= srcW {
-					i = srcW - 1
-				}
-				acc += float64(src[i*chansIn+srcC]) * (ws[j] * inv)
-			}
-			if acc < 0 {
-				acc = 0
-			} else if acc > 255 {
-				acc = 255
-			}
-			dst[x*chansOut+c] = byte(acc + 0.5)
+// Small LRU-ish cache so we don't rebuild per row (optional, but handy).
+var (
+	coeffCacheMu sync.Mutex
+	coeffCache   = struct {
+		srcW, dstW int
+		support    float64
+		ptr        *coeffTable
+	}{}
+)
+
+func getCoeffTable(srcW, dstW int, f Filter) *coeffTable {
+	coeffCacheMu.Lock()
+	defer coeffCacheMu.Unlock()
+
+	c := coeffCache
+	if c.ptr != nil && c.srcW == srcW && c.dstW == dstW && c.support == f.Support {
+		ct := c.ptr
+		return ct
+	}
+
+	ct := buildCoeffTable(srcW, dstW, f)
+
+	coeffCache = struct {
+		srcW, dstW int
+		support    float64
+		ptr        *coeffTable
+	}{srcW, dstW, f.Support, ct}
+	return ct
+}
+
+// Gray -> Gray
+func resampleGrayRowInto(dst []byte, dstW int, src []byte, srcW int, f Filter) {
+	if dstW <= 0 || srcW <= 0 {
+		return
+	}
+	ct := getCoeffTable(srcW, dstW, f)
+	for x := 0; x < dstW; x++ {
+		cr := ct.rows[x]
+		left := cr.left
+		w := cr.w
+		var acc float32
+		for i := 0; i < len(w); i++ {
+			acc += float32(src[left+i]) * w[i]
 		}
+		if acc < 0 {
+			acc = 0
+		} else if acc > 255 {
+			acc = 255
+		}
+		dst[x] = byte(acc + 0.5)
 	}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+// RGB -> RGBA (alpha const)
+func resampleRGBtoRGBAInto(dst []byte, dstW int, src []byte, srcW int, f Filter, alpha byte) {
+	if dstW <= 0 || srcW <= 0 {
+		return
 	}
-	return b
+	ct := getCoeffTable(srcW, dstW, f)
+	for x := 0; x < dstW; x++ {
+		cr := ct.rows[x]
+		left := cr.left
+		w := cr.w
+		var r, g, b float32
+		si := left * 3
+		for i := 0; i < len(w); i++ {
+			ww := w[i]
+			r += float32(src[si+0]) * ww
+			g += float32(src[si+1]) * ww
+			b += float32(src[si+2]) * ww
+			si += 3
+		}
+		i := x * 4
+		if r < 0 {
+			r = 0
+		} else if r > 255 {
+			r = 255
+		}
+		if g < 0 {
+			g = 0
+		} else if g > 255 {
+			g = 255
+		}
+		if b < 0 {
+			b = 0
+		} else if b > 255 {
+			b = 255
+		}
+		dst[i+0] = byte(r + 0.5)
+		dst[i+1] = byte(g + 0.5)
+		dst[i+2] = byte(b + 0.5)
+		dst[i+3] = alpha
+	}
 }
 
-// resampleRowRGBAIntoPremulNormalized: proper RGBA resampling in premultiplied-alpha space.
-// src and dst are RGBA (4 chans), no allocations, normalized weights.
-func resampleRowRGBAIntoPremulNormalized(dst []byte, dstW int, src []byte, srcW int, filter Filter) {
+// resampleRGBAStraightInto: RGBA resampling WITHOUT premultiplying.
+// Uses the cached coeff table; no allocations in the hot path.
+// Expected: can produce halos on semi-transparent edges vs the premul version.
+func resampleRGBAStraightInto(dst []byte, dstW int, src []byte, srcW int, f Filter) {
 	if dstW <= 0 || srcW <= 0 {
 		return
 	}
 	const chans = 4
-	scale := float64(srcW) / float64(dstW)
-	support := filter.Support * scale
+	ct := getCoeffTable(srcW, dstW, f)
 	for x := 0; x < dstW; x++ {
-		center := (float64(x) + 0.5) * scale
-		left := int(math.Ceil(center - support))
-		right := int(math.Floor(center + support))
+		cr := ct.rows[x]
+		left := cr.left
+		w := cr.w
 
-		var sumW float64
-		ws := make([]float64, right-left+1)
-		idx := 0
-		for i := left; i <= right; i++ {
-			ii := i
-			if ii < 0 {
-				ii = 0
-			} else if ii >= srcW {
-				ii = srcW - 1
-			}
-			w := filter.Kernel((float64(ii) + 0.5 - center) / scale)
-			ws[idx] = w
-			sumW += w
-			idx++
+		var r, g, b, a float32
+		si := left * chans
+		for i := 0; i < len(w); i++ {
+			ww := w[i]
+			r += float32(src[si+0]) * ww
+			g += float32(src[si+1]) * ww
+			b += float32(src[si+2]) * ww
+			a += float32(src[si+3]) * ww
+			si += chans
 		}
-		if sumW == 0 {
-			// nearest
-			sx := int(center)
-			if sx < 0 {
-				sx = 0
-			} else if sx >= srcW {
-				sx = srcW - 1
-			}
-			copy(dst[x*chans:x*chans+chans], src[sx*chans:sx*chans+chans])
-			continue
+		if r < 0 {
+			r = 0
+		} else if r > 255 {
+			r = 255
 		}
-		inv := 1.0 / sumW
+		if g < 0 {
+			g = 0
+		} else if g > 255 {
+			g = 255
+		}
+		if b < 0 {
+			b = 0
+		} else if b > 255 {
+			b = 255
+		}
+		if a < 0 {
+			a = 0
+		} else if a > 255 {
+			a = 255
+		}
+		di := x * chans
+		dst[di+0] = byte(r + 0.5)
+		dst[di+1] = byte(g + 0.5)
+		dst[di+2] = byte(b + 0.5)
+		dst[di+3] = byte(a + 0.5)
+	}
+}
 
-		var accR, accG, accB, accA float64
-		for j := 0; j < len(ws); j++ {
-			i := left + j
-			if i < 0 {
-				i = 0
-			} else if i >= srcW {
-				i = srcW - 1
-			}
-			w := ws[j] * inv
-			si := i * chans
-			a := float64(src[si+3])
-			accA += a * w
-			// premultiply
-			aw := a * w
-			accR += float64(src[si+0]) * aw
-			accG += float64(src[si+1]) * aw
-			accB += float64(src[si+2]) * aw
+// Premultiplied RGBA -> RGBA (correct alpha handling)
+func resampleRGBAPremulInto(dst []byte, dstW int, src []byte, srcW int, f Filter) {
+	if dstW <= 0 || srcW <= 0 {
+		return
+	}
+	ct := getCoeffTable(srcW, dstW, f)
+	for x := 0; x < dstW; x++ {
+		cr := ct.rows[x]
+		left := cr.left
+		w := cr.w
+		var ar, ag, ab, aa float32
+		si := left * 4
+		for i := 0; i < len(w); i++ {
+			ww := w[i]
+			a := float32(src[si+3])
+			aa += a * ww
+			aw := a * ww
+			ar += float32(src[si+0]) * aw
+			ag += float32(src[si+1]) * aw
+			ab += float32(src[si+2]) * aw
+			si += 4
 		}
-		// unpremultiply
-		var R, G, B, A float64
-		A = accA
-		if A > 0 {
-			R = accR / A
-			G = accG / A
-			B = accB / A
-		} else {
-			R, G, B = 0, 0, 0
+		var R, G, B float32
+		if aa > 0 {
+			invA := 1.0 / aa
+			R, G, B = ar*invA, ag*invA, ab*invA
 		}
 		if R < 0 {
 			R = 0
@@ -248,15 +302,46 @@ func resampleRowRGBAIntoPremulNormalized(dst []byte, dstW int, src []byte, srcW 
 		} else if B > 255 {
 			B = 255
 		}
-		if A < 0 {
-			A = 0
-		} else if A > 255 {
-			A = 255
+		if aa < 0 {
+			aa = 0
+		} else if aa > 255 {
+			aa = 255
 		}
-		i := x * chans
+		i := x * 4
 		dst[i+0] = byte(R + 0.5)
 		dst[i+1] = byte(G + 0.5)
 		dst[i+2] = byte(B + 0.5)
-		dst[i+3] = byte(A + 0.5)
+		dst[i+3] = byte(aa + 0.5)
+	}
+}
+
+// Gray (1 chan) -> RGBA (4 chan) with constant alpha.
+// dst must have capacity >= dstW*4. src is len == srcW.
+// Uses the prebuilt coeff table; no per-pixel allocs.
+func resampleGrayToRGBAInto(dst []byte, dstW int, src []byte, srcW int, f Filter, alpha byte) {
+	if dstW <= 0 || srcW <= 0 {
+		return
+	}
+	ct := getCoeffTable(srcW, dstW, f)
+	for x := 0; x < dstW; x++ {
+		cr := ct.rows[x]
+		left := cr.left
+		w := cr.w
+
+		var v float32
+		for i := 0; i < len(w); i++ {
+			v += float32(src[left+i]) * w[i]
+		}
+		if v < 0 {
+			v = 0
+		} else if v > 255 {
+			v = 255
+		}
+		iv := byte(v + 0.5)
+		di := x * 4
+		dst[di+0] = iv // R
+		dst[di+1] = iv // G
+		dst[di+2] = iv // B
+		dst[di+3] = alpha
 	}
 }
