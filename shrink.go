@@ -30,37 +30,53 @@ func UseImagingFilter(support float64, kernel func(float64) float64) {
 	TargetFilter = &Filter{Support: support, Kernel: kernel}
 }
 
-// --- Coeff table -------------------------------------------------------------
-
-type coeffRow struct {
-	left int
-	w    []float32 // length == taps for this dst pixel (normalized)
-}
-
+// One flat table per (srcW, dstW, filter.Support). Kernel pointer equality is unreliable,
+// so we key by support; if you change Kernel impl with same support, rebuild explicitly.
 type coeffTable struct {
 	srcW, dstW int
-	filter     Filter
-	scale      float64
-	supportPx  int
-	rows       []coeffRow
+	scale      float64 // = float64(srcW)/float64(dstW)
+	support    float64 // = filter.Support
+
+	left []int32   // len == dstW, starting src index for each dst pixel
+	off  []int32   // len == dstW, offset into w[] where weights start
+	cnt  []uint16  // len == dstW, number of taps for this dst pixel
+	w    []float32 // flat weights buffer (all pixels concatenated)
 }
 
-// Build once per (srcW,dstW,filter). Anti-aliasing: taps grow with shrink factor.
-func buildCoeffTable(srcW, dstW int, f Filter) *coeffTable {
+func buildCoeffTableFlat(srcW, dstW int, f Filter) *coeffTable {
 	ct := &coeffTable{
-		srcW: srcW, dstW: dstW, filter: f,
-		scale: float64(srcW) / float64(dstW),
+		srcW: srcW, dstW: dstW,
+		scale:   float64(srcW) / float64(dstW),
+		support: f.Support,
+		left:    make([]int32, dstW),
+		off:     make([]int32, dstW),
+		cnt:     make([]uint16, dstW),
 	}
-	// Effective support in *source* pixels
-	supp := f.Support * ct.scale
-	// Max taps per pixel ~ floor(2*supp)+1
-	maxTaps := int(math.Floor(2*supp)) + 1
-	if maxTaps < 1 {
-		maxTaps = 1
-	}
-	ct.supportPx = maxTaps
 
-	ct.rows = make([]coeffRow, dstW)
+	// First pass: figure total number of weights to allocate.
+	total := 0
+	supp := f.Support * ct.scale
+	for x := 0; x < dstW; x++ {
+		center := (float64(x) + 0.5) * ct.scale
+		left := int(math.Ceil(center - supp))
+		right := int(math.Floor(center + supp))
+		if left < 0 {
+			left = 0
+		}
+		if right >= srcW {
+			right = srcW - 1
+		}
+		taps := right - left + 1
+		if taps < 1 {
+			taps = 1
+		}
+		total += taps
+	}
+
+	ct.w = make([]float32, total)
+
+	// Second pass: fill metadata + weights (normalized per pixel).
+	wpos := 0
 	for x := 0; x < dstW; x++ {
 		center := (float64(x) + 0.5) * ct.scale
 		left := int(math.Ceil(center - supp))
@@ -76,70 +92,72 @@ func buildCoeffTable(srcW, dstW int, f Filter) *coeffTable {
 			taps = 1
 		}
 
-		// compute weights & normalize
-		w := make([]float32, taps)
+		ct.left[x] = int32(left)
+		ct.off[x] = int32(wpos)
+		ct.cnt[x] = uint16(taps)
+
 		var sum float64
 		for i := 0; i < taps; i++ {
-			// map tap index -> source pixel index
 			si := left + i
 			// normalized distance in source domain
 			dx := (float64(si) + 0.5 - center) / ct.scale
 			ww := f.Kernel(dx)
+			ct.w[wpos+i] = float32(ww)
 			sum += ww
-			w[i] = float32(ww)
 		}
 		if sum == 0 {
-			// fallback to NN
-			for i := range w {
-				w[i] = 0
-			}
+			// Fallback: nearest neighbor
+			// collapse to one tap at nearest source pixel
 			sx := int(center)
 			if sx < 0 {
 				sx = 0
 			} else if sx >= srcW {
 				sx = srcW - 1
 			}
-			left = sx
-			w = w[:1]
-			w[0] = 1
-		} else {
-			inv := float32(1.0 / sum)
-			for i := range w {
-				w[i] *= inv
-			}
+			ct.left[x] = int32(sx)
+			ct.off[x] = int32(wpos)
+			ct.cnt[x] = 1
+			ct.w[wpos] = 1
+			wpos += 1
+			continue
 		}
-		ct.rows[x] = coeffRow{left: left, w: w}
+		inv := float32(1.0 / sum)
+		for i := 0; i < taps; i++ {
+			ct.w[wpos+i] *= inv
+		}
+		wpos += taps
 	}
 	return ct
 }
 
-// Small LRU-ish cache so we don't rebuild per row (optional, but handy).
 var (
 	coeffCacheMu sync.Mutex
-	coeffCache   = struct {
+	coeffCache   struct {
 		srcW, dstW int
 		support    float64
-		ptr        *coeffTable
-	}{}
+		ct         *coeffTable
+	}
 )
 
 func getCoeffTable(srcW, dstW int, f Filter) *coeffTable {
 	coeffCacheMu.Lock()
-	defer coeffCacheMu.Unlock()
-
 	c := coeffCache
-	if c.ptr != nil && c.srcW == srcW && c.dstW == dstW && c.support == f.Support {
-		ct := c.ptr
+	if c.ct != nil && c.srcW == srcW && c.dstW == dstW && c.support == f.Support {
+		ct := c.ct
+		coeffCacheMu.Unlock()
 		return ct
 	}
+	coeffCacheMu.Unlock()
 
-	ct := buildCoeffTable(srcW, dstW, f)
+	ct := buildCoeffTableFlat(srcW, dstW, f)
 
+	coeffCacheMu.Lock()
 	coeffCache = struct {
 		srcW, dstW int
 		support    float64
-		ptr        *coeffTable
+		ct         *coeffTable
 	}{srcW, dstW, f.Support, ct}
+	coeffCacheMu.Unlock()
 	return ct
 }
 
@@ -150,12 +168,14 @@ func resampleGrayRowInto(dst []byte, dstW int, src []byte, srcW int, f Filter) {
 	}
 	ct := getCoeffTable(srcW, dstW, f)
 	for x := 0; x < dstW; x++ {
-		cr := ct.rows[x]
-		left := cr.left
-		w := cr.w
+		left := int(ct.left[x])
+		off := int(ct.off[x])
+		n := int(ct.cnt[x])
+		ws := ct.w[off : off+n]
+
 		var acc float32
-		for i := 0; i < len(w); i++ {
-			acc += float32(src[left+i]) * w[i]
+		for i := 0; i < n; i++ {
+			acc += float32(src[left+i]) * ws[i]
 		}
 		if acc < 0 {
 			acc = 0
@@ -173,16 +193,18 @@ func resampleRGBtoRGBAInto(dst []byte, dstW int, src []byte, srcW int, f Filter,
 	}
 	ct := getCoeffTable(srcW, dstW, f)
 	for x := 0; x < dstW; x++ {
-		cr := ct.rows[x]
-		left := cr.left
-		w := cr.w
+		left := int(ct.left[x])
+		off := int(ct.off[x])
+		n := int(ct.cnt[x])
+		ws := ct.w[off : off+n]
+
 		var r, g, b float32
 		si := left * 3
-		for i := 0; i < len(w); i++ {
-			ww := w[i]
-			r += float32(src[si+0]) * ww
-			g += float32(src[si+1]) * ww
-			b += float32(src[si+2]) * ww
+		for i := 0; i < n; i++ {
+			w := ws[i]
+			r += float32(src[si+0]) * w
+			g += float32(src[si+1]) * w
+			b += float32(src[si+2]) * w
 			si += 3
 		}
 		i := x * 4
@@ -208,58 +230,6 @@ func resampleRGBtoRGBAInto(dst []byte, dstW int, src []byte, srcW int, f Filter,
 	}
 }
 
-// resampleRGBAStraightInto: RGBA resampling WITHOUT premultiplying.
-// Uses the cached coeff table; no allocations in the hot path.
-// Expected: can produce halos on semi-transparent edges vs the premul version.
-func resampleRGBAStraightInto(dst []byte, dstW int, src []byte, srcW int, f Filter) {
-	if dstW <= 0 || srcW <= 0 {
-		return
-	}
-	const chans = 4
-	ct := getCoeffTable(srcW, dstW, f)
-	for x := 0; x < dstW; x++ {
-		cr := ct.rows[x]
-		left := cr.left
-		w := cr.w
-
-		var r, g, b, a float32
-		si := left * chans
-		for i := 0; i < len(w); i++ {
-			ww := w[i]
-			r += float32(src[si+0]) * ww
-			g += float32(src[si+1]) * ww
-			b += float32(src[si+2]) * ww
-			a += float32(src[si+3]) * ww
-			si += chans
-		}
-		if r < 0 {
-			r = 0
-		} else if r > 255 {
-			r = 255
-		}
-		if g < 0 {
-			g = 0
-		} else if g > 255 {
-			g = 255
-		}
-		if b < 0 {
-			b = 0
-		} else if b > 255 {
-			b = 255
-		}
-		if a < 0 {
-			a = 0
-		} else if a > 255 {
-			a = 255
-		}
-		di := x * chans
-		dst[di+0] = byte(r + 0.5)
-		dst[di+1] = byte(g + 0.5)
-		dst[di+2] = byte(b + 0.5)
-		dst[di+3] = byte(a + 0.5)
-	}
-}
-
 // Premultiplied RGBA -> RGBA (correct alpha handling)
 func resampleRGBAPremulInto(dst []byte, dstW int, src []byte, srcW int, f Filter) {
 	if dstW <= 0 || srcW <= 0 {
@@ -267,16 +237,18 @@ func resampleRGBAPremulInto(dst []byte, dstW int, src []byte, srcW int, f Filter
 	}
 	ct := getCoeffTable(srcW, dstW, f)
 	for x := 0; x < dstW; x++ {
-		cr := ct.rows[x]
-		left := cr.left
-		w := cr.w
+		left := int(ct.left[x])
+		off := int(ct.off[x])
+		n := int(ct.cnt[x])
+		ws := ct.w[off : off+n]
+
 		var ar, ag, ab, aa float32
 		si := left * 4
-		for i := 0; i < len(w); i++ {
-			ww := w[i]
+		for i := 0; i < n; i++ {
+			w := ws[i]
 			a := float32(src[si+3])
-			aa += a * ww
-			aw := a * ww
+			aa += a * w
+			aw := a * w
 			ar += float32(src[si+0]) * aw
 			ag += float32(src[si+1]) * aw
 			ab += float32(src[si+2]) * aw
@@ -324,13 +296,14 @@ func resampleGrayToRGBAInto(dst []byte, dstW int, src []byte, srcW int, f Filter
 	}
 	ct := getCoeffTable(srcW, dstW, f)
 	for x := 0; x < dstW; x++ {
-		cr := ct.rows[x]
-		left := cr.left
-		w := cr.w
+		left := int(ct.left[x])
+		off := int(ct.off[x])
+		n := int(ct.cnt[x])
+		ws := ct.w[off : off+n]
 
 		var v float32
-		for i := 0; i < len(w); i++ {
-			v += float32(src[left+i]) * w[i]
+		for i := 0; i < n; i++ {
+			v += float32(src[left+i]) * ws[i]
 		}
 		if v < 0 {
 			v = 0
@@ -338,10 +311,10 @@ func resampleGrayToRGBAInto(dst []byte, dstW int, src []byte, srcW int, f Filter
 			v = 255
 		}
 		iv := byte(v + 0.5)
-		di := x * 4
-		dst[di+0] = iv // R
-		dst[di+1] = iv // G
-		dst[di+2] = iv // B
-		dst[di+3] = alpha
+		i := x * 4
+		dst[i+0] = iv
+		dst[i+1] = iv
+		dst[i+2] = iv
+		dst[i+3] = alpha
 	}
 }

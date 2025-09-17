@@ -71,7 +71,7 @@ func BenchmarkShrinkInitial(b *testing.B) {
 		for _, file := range files {
 			file.Seek(0, 0)
 
-			image, err := Decode(file)
+			image, err := png.Decode(file)
 			require.NoError(b, err)
 			_ = imaging.Resize(image, 400, image.Bounds().Dy(), imaging.Lanczos)
 		}
