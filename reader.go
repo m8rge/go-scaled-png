@@ -118,6 +118,10 @@ type decoder struct {
 	tmp           [3 * 256]byte
 	interlace     int
 
+	targetWidth  int
+	targetHeight int
+	filter       ResampleFilter
+
 	// useTransparent and transparent are used for grayscale and truecolor
 	// transparency, as opposed to palette transparency.
 	useTransparent bool
@@ -435,8 +439,8 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 		}
 	}
 	rect := image.Rect(0, 0, width, height)
-	if TargetWidth > 0 && TargetWidth < width {
-		rect = image.Rect(0, 0, TargetWidth, height)
+	if d.targetWidth > 0 && d.targetWidth < width {
+		rect = image.Rect(0, 0, d.targetWidth, height)
 	}
 	switch d.cb {
 	case cbG1, cbG2, cbG4, cbG8:
@@ -626,8 +630,8 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 			}
 		case cbG8:
 			// Gray 8-bit, optional tRNS
-			if TargetWidth > 0 && TargetWidth < width && TargetFilter != nil {
-				dstW := TargetWidth
+			if d.targetWidth > 0 && d.targetWidth < width {
+				dstW := d.targetWidth
 				if d.useTransparent {
 					// Gray+tRNS -> NRGBA
 					t := d.transparent[1]
@@ -636,7 +640,7 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 					// We resample as 1 channel, then expand to RGBA in-place per pixel.
 					// For minimal changes, do direct 1->4 resampling with alpha filled to 255,
 					// then set 0 where gray == t.
-					resampleGrayToRGBAIntoQ15(row[:dstW*4], dstW, cdat, width, *TargetFilter, 0xff)
+					resampleGrayToRGBAIntoQ15(row[:dstW*4], dstW, cdat, width, d.filter, 0xff)
 					for x := 0; x < dstW; x++ {
 						i := x * 4
 						v := row[i+0] // R=G=B
@@ -652,7 +656,7 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 				} else {
 					// Pure gray -> gray
 					row := gray.Pix[pixOffset : pixOffset+gray.Stride]
-					resampleGrayRowIntoQ15(row[:dstW], dstW, cdat, width, *TargetFilter)
+					resampleGrayRowIntoQ15(row[:dstW], dstW, cdat, width, d.filter)
 					for k := dstW; k < gray.Rect.Dx(); k++ {
 						row[k] = 0
 					}
@@ -683,8 +687,8 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 			}
 		case cbTC8:
 			// RGB 8-bit, optional tRNS -> write into RGBA/NRGBA.
-			if TargetWidth > 0 && TargetWidth < width && TargetFilter != nil {
-				dstW := TargetWidth
+			if d.targetWidth > 0 && d.targetWidth < width {
+				dstW := d.targetWidth
 				if d.useTransparent {
 					// tRNS => NRGBA, alpha=0 where RGB matches transparent key.
 					// Do it in two stages without alloc:
@@ -694,7 +698,7 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 					tr, tg, tb := d.transparent[1], d.transparent[3], d.transparent[5]
 					row := nrgba.Pix[pixOffset : pixOffset+nrgba.Stride]
 					// Resample RGB channels:
-					resampleRGBtoRGBAIntoQ15(row[:dstW*4], dstW, cdat, width, *TargetFilter, 0xff)
+					resampleRGBtoRGBAIntoQ15(row[:dstW*4], dstW, cdat, width, d.filter, 0xff)
 					// Fix alpha using tRNS on the *resampled* RGB:
 					for x := 0; x < dstW; x++ {
 						i := x * 4
@@ -703,16 +707,12 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 							row[i+3] = 0x00
 						}
 					}
-					// Optional: zero right tail to visualize shrink
-					for k := dstW * 4; k < nrgba.Rect.Dx()*4; k++ {
-						row[k] = 0
-					}
 					pixOffset += nrgba.Stride
 					break
 				} else {
 					// RGB -> RGBA, constant alpha 255
 					row := rgba.Pix[pixOffset : pixOffset+rgba.Stride]
-					resampleRGBtoRGBAIntoQ15(row[:dstW*4], dstW, cdat, width, *TargetFilter, 0xff)
+					resampleRGBtoRGBAIntoQ15(row[:dstW*4], dstW, cdat, width, d.filter, 0xff)
 					for k := dstW * 4; k < rgba.Rect.Dx()*4; k++ {
 						row[k] = 0
 					}
@@ -799,10 +799,10 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 			copy(paletted.Pix[pixOffset:], cdat)
 			pixOffset += paletted.Stride
 		case cbTCA8:
-			if TargetWidth > 0 && TargetWidth < width && TargetFilter != nil {
+			if d.targetWidth > 0 && d.targetWidth < width {
 				row := nrgba.Pix[pixOffset : pixOffset+nrgba.Stride]
-				resampleRGBAPremulIntoQ15(row[:TargetWidth*4], TargetWidth, cdat, width, *TargetFilter)
-				for k := TargetWidth * 4; k < nrgba.Rect.Dx()*4; k++ {
+				resampleRGBAPremulIntoQ15(row[:d.targetWidth*4], d.targetWidth, cdat, width, d.filter)
+				for k := d.targetWidth * 4; k < nrgba.Rect.Dx()*4; k++ {
 					row[k] = 0
 				}
 				pixOffset += nrgba.Stride
@@ -1056,11 +1056,16 @@ func (d *decoder) checkHeader() error {
 }
 
 // Decode reads a PNG image from r and returns it as an [image.Image].
-// The type of Image returned depends on the PNG contents.
-func Decode(r io.Reader) (image.Image, error) {
+// If targetWidth/targetHeight are > 0, the decoder may scale while decoding.
+// MVP: only 8-bit decode paths (cbTC8 / cbTCA8 / cbG8) are supported here.
+// Pass filter for resampling (e.g. ImagingFilter(Lanczos.Support, Lanczos.Kernel)).
+func Decode(r io.Reader, targetWidth, targetHeight int, filter ResampleFilter) (image.Image, error) {
 	d := &decoder{
-		r:   r,
-		crc: crc32.NewIEEE(),
+		r:            r,
+		crc:          crc32.NewIEEE(),
+		targetWidth:  targetWidth,
+		targetHeight: targetHeight,
+		filter:       filter,
 	}
 	if err := d.checkHeader(); err != nil {
 		if err == io.EOF {
@@ -1138,8 +1143,4 @@ func DecodeConfig(r io.Reader) (image.Config, error) {
 		Width:      d.width,
 		Height:     d.height,
 	}, nil
-}
-
-func init() {
-	image.RegisterFormat("png", pngHeader, Decode, DecodeConfig)
 }

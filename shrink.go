@@ -5,31 +5,6 @@ import (
 	"sync"
 )
 
-// --- Optional horizontal shrinking API (minimal-invasive) --------------------
-// TargetWidth enables optional horizontal shrinking during decode.
-// If 0 or >= source width, shrinking is disabled (original behavior).
-// MVP: only 8-bit decode paths (cbTC8 / cbTCA8 / cbG8) are supported here.
-var TargetWidth int
-
-// Filter is a generic resampling filter: identical in spirit to imaging.ResampleFilter.
-type Filter struct {
-	Support float64
-	Kernel  func(x float64) float64
-}
-
-// TargetFilter, if non-nil, selects the resampling kernel to use for horizontal shrink.
-// Example adapter (if you use github.com/disintegration/imaging or kovidgoyal/imaging):
-//
-//	png.UseImagingFilter(imaging.Lanczos)
-var TargetFilter *Filter
-
-// UseImagingFilter adapts an imaging.ResampleFilter (Support, Kernel func) to our Filter.
-// Declare it here to avoid importing "imaging" and keep upstream diffs tiny.
-// Call from your code like: png.UseImagingFilter(imaging.Lanczos)
-func UseImagingFilter(support float64, kernel func(float64) float64) {
-	TargetFilter = &Filter{Support: support, Kernel: kernel}
-}
-
 // Q15 fixed-point weights table: one build per (srcW, dstW, filter.Support).
 // We store weights in int16 where 1.0 == 32768 (1<<15). Per-pixel weights sum to 32768.
 type coeffTableQ15 struct {
@@ -42,7 +17,7 @@ type coeffTableQ15 struct {
 	wQ15       []int16  // flat weights, all pixels concatenated
 }
 
-func buildCoeffTableFlatQ15(srcW, dstW int, f Filter) *coeffTableQ15 {
+func buildCoeffTableFlatQ15(srcW, dstW int, f ResampleFilter) *coeffTableQ15 {
 	ct := &coeffTableQ15{
 		srcW: srcW, dstW: dstW,
 		scale:   float64(srcW) / float64(dstW),
@@ -173,7 +148,7 @@ var (
 	}
 )
 
-func getCoeffTableQ15(srcW, dstW int, f Filter) *coeffTableQ15 {
+func getCoeffTableQ15(srcW, dstW int, f ResampleFilter) *coeffTableQ15 {
 	coeffCacheQ15Mu.Lock()
 	c := coeffCacheQ15
 	if c.ct != nil && c.srcW == srcW && c.dstW == dstW && c.support == f.Support {
@@ -196,7 +171,7 @@ func getCoeffTableQ15(srcW, dstW int, f Filter) *coeffTableQ15 {
 }
 
 // Uses int32 accumulator (safe: 255*32768*taps; taps typically <= ~100).
-func resampleGrayRowIntoQ15(dst []byte, dstW int, src []byte, srcW int, f Filter) {
+func resampleGrayRowIntoQ15(dst []byte, dstW int, src []byte, srcW int, f ResampleFilter) {
 	if dstW <= 0 || srcW <= 0 {
 		return
 	}
@@ -226,7 +201,7 @@ func resampleGrayRowIntoQ15(dst []byte, dstW int, src []byte, srcW int, f Filter
 	}
 }
 
-func resampleRGBtoRGBAIntoQ15(dst []byte, dstW int, src []byte, srcW int, f Filter, alpha byte) {
+func resampleRGBtoRGBAIntoQ15(dst []byte, dstW int, src []byte, srcW int, f ResampleFilter, alpha byte) {
 	if dstW <= 0 || srcW <= 0 {
 		return
 	}
@@ -275,7 +250,7 @@ func resampleRGBtoRGBAIntoQ15(dst []byte, dstW int, src []byte, srcW int, f Filt
 	}
 }
 
-func resampleRGBAPremulIntoQ15(dst []byte, dstW int, src []byte, srcW int, f Filter) {
+func resampleRGBAPremulIntoQ15(dst []byte, dstW int, src []byte, srcW int, f ResampleFilter) {
 	if dstW <= 0 || srcW <= 0 {
 		return
 	}
@@ -337,7 +312,7 @@ func resampleRGBAPremulIntoQ15(dst []byte, dstW int, src []byte, srcW int, f Fil
 	}
 }
 
-func resampleGrayToRGBAIntoQ15(dst []byte, dstW int, src []byte, srcW int, f Filter, alpha byte) {
+func resampleGrayToRGBAIntoQ15(dst []byte, dstW int, src []byte, srcW int, f ResampleFilter, alpha byte) {
 	if dstW <= 0 || srcW <= 0 {
 		return
 	}

@@ -11,16 +11,13 @@ import (
 )
 
 func TestShrink(t *testing.T) {
-	TargetWidth = 400
-	UseImagingFilter(imaging.Lanczos.Support, imaging.Lanczos.Kernel)
-
 	names := []string{"1.png", "2.png", "3.png"}
 	outNames := []string{"1-out.png", "2-out.png", "3-out.png"}
 
 	for i, name := range names {
 		data, err := os.Open(name)
 		require.NoError(t, err)
-		image, err := Decode(data)
+		image, err := Decode(data, 400, 0, Lanczos)
 		require.NoError(t, err)
 
 		file, err := os.Create(outNames[i])
@@ -32,8 +29,6 @@ func TestShrink(t *testing.T) {
 
 func BenchmarkShrink(b *testing.B) {
 	runtime.GOMAXPROCS(1)
-	TargetWidth = 400
-	UseImagingFilter(imaging.Lanczos.Support, imaging.Lanczos.Kernel)
 
 	names := []string{"1.png"}
 	files := make([]*os.File, len(names))
@@ -48,7 +43,7 @@ func BenchmarkShrink(b *testing.B) {
 		for _, file := range files {
 			file.Seek(0, 0)
 
-			_, err := Decode(file)
+			_, err := Decode(file, 400, 0, Lanczos)
 			require.NoError(b, err)
 		}
 	}
@@ -56,7 +51,6 @@ func BenchmarkShrink(b *testing.B) {
 
 func BenchmarkShrinkInitial(b *testing.B) {
 	runtime.GOMAXPROCS(1)
-	TargetWidth = 0
 
 	names := []string{"1.png"}
 	files := make([]*os.File, len(names))
