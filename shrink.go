@@ -30,21 +30,20 @@ func UseImagingFilter(support float64, kernel func(float64) float64) {
 	TargetFilter = &Filter{Support: support, Kernel: kernel}
 }
 
-// One flat table per (srcW, dstW, filter.Support). Kernel pointer equality is unreliable,
-// so we key by support; if you change Kernel impl with same support, rebuild explicitly.
-type coeffTable struct {
+// Q15 fixed-point weights table: one build per (srcW, dstW, filter.Support).
+// We store weights in int16 where 1.0 == 32768 (1<<15). Per-pixel weights sum to 32768.
+type coeffTableQ15 struct {
 	srcW, dstW int
-	scale      float64 // = float64(srcW)/float64(dstW)
-	support    float64 // = filter.Support
-
-	left []int32   // len == dstW, starting src index for each dst pixel
-	off  []int32   // len == dstW, offset into w[] where weights start
-	cnt  []uint16  // len == dstW, number of taps for this dst pixel
-	w    []float32 // flat weights buffer (all pixels concatenated)
+	scale      float64
+	support    float64
+	left       []int32  // len == dstW
+	off        []int32  // len == dstW, offset into wQ15
+	cnt        []uint16 // len == dstW, number of taps
+	wQ15       []int16  // flat weights, all pixels concatenated
 }
 
-func buildCoeffTableFlat(srcW, dstW int, f Filter) *coeffTable {
-	ct := &coeffTable{
+func buildCoeffTableFlatQ15(srcW, dstW int, f Filter) *coeffTableQ15 {
+	ct := &coeffTableQ15{
 		srcW: srcW, dstW: dstW,
 		scale:   float64(srcW) / float64(dstW),
 		support: f.Support,
@@ -52,10 +51,10 @@ func buildCoeffTableFlat(srcW, dstW int, f Filter) *coeffTable {
 		off:     make([]int32, dstW),
 		cnt:     make([]uint16, dstW),
 	}
-
-	// First pass: figure total number of weights to allocate.
-	total := 0
 	supp := f.Support * ct.scale
+
+	// first pass: total taps
+	total := 0
 	for x := 0; x < dstW; x++ {
 		center := (float64(x) + 0.5) * ct.scale
 		left := int(math.Ceil(center - supp))
@@ -72,10 +71,10 @@ func buildCoeffTableFlat(srcW, dstW int, f Filter) *coeffTable {
 		}
 		total += taps
 	}
+	ct.wQ15 = make([]int16, total)
 
-	ct.w = make([]float32, total)
-
-	// Second pass: fill metadata + weights (normalized per pixel).
+	// second pass: fill meta + Q15 weights normalized to sum==32768
+	const ONE = 1<<15 - 1 // 32768
 	wpos := 0
 	for x := 0; x < dstW; x++ {
 		center := (float64(x) + 0.5) * ct.scale
@@ -96,18 +95,25 @@ func buildCoeffTableFlat(srcW, dstW int, f Filter) *coeffTable {
 		ct.off[x] = int32(wpos)
 		ct.cnt[x] = uint16(taps)
 
-		var sum float64
+		// compute float weights + sum
+		sum := 0.0
+		// keep track of argmax for residual fixup
+		maxIdx := 0
+		maxAbs := 0.0
 		for i := 0; i < taps; i++ {
 			si := left + i
-			// normalized distance in source domain
 			dx := (float64(si) + 0.5 - center) / ct.scale
 			ww := f.Kernel(dx)
-			ct.w[wpos+i] = float32(ww)
 			sum += ww
+			if abs := math.Abs(ww); abs > maxAbs {
+				maxAbs = abs
+				maxIdx = i
+			}
+			// temp store as float in a scratch area? we can reuse ct.wQ15 then overwrite
+			// but simpler: store in a small local slice
 		}
 		if sum == 0 {
-			// Fallback: nearest neighbor
-			// collapse to one tap at nearest source pixel
+			// NN fallback
 			sx := int(center)
 			if sx < 0 {
 				sx = 0
@@ -117,13 +123,41 @@ func buildCoeffTableFlat(srcW, dstW int, f Filter) *coeffTable {
 			ct.left[x] = int32(sx)
 			ct.off[x] = int32(wpos)
 			ct.cnt[x] = 1
-			ct.w[wpos] = 1
+			ct.wQ15[wpos] = int16(ONE)
 			wpos += 1
 			continue
 		}
-		inv := float32(1.0 / sum)
+		// second pass for this pixel: quantize to Q15 and normalize exactly
+		// Recompute weights to avoid storing a temp slice (keeps allocs at zero)
+		sumQ := 0
 		for i := 0; i < taps; i++ {
-			ct.w[wpos+i] *= inv
+			si := left + i
+			dx := (float64(si) + 0.5 - center) / ct.scale
+			ww := f.Kernel(dx) / sum
+			q := int(math.Round(ww * ONE))
+			// clamp to int16 range
+			if q > 32767 {
+				q = 32767
+			}
+			if q < -32768 {
+				q = -32768
+			}
+			ct.wQ15[wpos+i] = int16(q)
+			sumQ += q
+		}
+		// force exact normalization by fixing the largest-magnitude tap
+		if sumQ != ONE {
+			i := maxIdx
+			idx := wpos + i
+			fix := ONE - sumQ
+			val := int(ct.wQ15[idx]) + fix
+			if val > 32767 {
+				val = 32767
+			}
+			if val < -32768 {
+				val = -32768
+			}
+			ct.wQ15[idx] = int16(val)
 		}
 		wpos += taps
 	}
@@ -131,133 +165,149 @@ func buildCoeffTableFlat(srcW, dstW int, f Filter) *coeffTable {
 }
 
 var (
-	coeffCacheMu sync.Mutex
-	coeffCache   struct {
+	coeffCacheQ15Mu sync.Mutex
+	coeffCacheQ15   struct {
 		srcW, dstW int
 		support    float64
-		ct         *coeffTable
+		ct         *coeffTableQ15
 	}
 )
 
-func getCoeffTable(srcW, dstW int, f Filter) *coeffTable {
-	coeffCacheMu.Lock()
-	c := coeffCache
+func getCoeffTableQ15(srcW, dstW int, f Filter) *coeffTableQ15 {
+	coeffCacheQ15Mu.Lock()
+	c := coeffCacheQ15
 	if c.ct != nil && c.srcW == srcW && c.dstW == dstW && c.support == f.Support {
 		ct := c.ct
-		coeffCacheMu.Unlock()
+		coeffCacheQ15Mu.Unlock()
 		return ct
 	}
-	coeffCacheMu.Unlock()
+	coeffCacheQ15Mu.Unlock()
 
-	ct := buildCoeffTableFlat(srcW, dstW, f)
+	ct := buildCoeffTableFlatQ15(srcW, dstW, f)
 
-	coeffCacheMu.Lock()
-	coeffCache = struct {
+	coeffCacheQ15Mu.Lock()
+	coeffCacheQ15 = struct {
 		srcW, dstW int
 		support    float64
-		ct         *coeffTable
+		ct         *coeffTableQ15
 	}{srcW, dstW, f.Support, ct}
-	coeffCacheMu.Unlock()
+	coeffCacheQ15Mu.Unlock()
 	return ct
 }
 
-// Gray -> Gray
-func resampleGrayRowInto(dst []byte, dstW int, src []byte, srcW int, f Filter) {
+// Uses int32 accumulator (safe: 255*32768*taps; taps typically <= ~100).
+func resampleGrayRowIntoQ15(dst []byte, dstW int, src []byte, srcW int, f Filter) {
 	if dstW <= 0 || srcW <= 0 {
 		return
 	}
-	ct := getCoeffTable(srcW, dstW, f)
+	ct := getCoeffTableQ15(srcW, dstW, f)
+	const SHIFT = 15
+	const ROUND = 1 << (SHIFT - 1)
 	for x := 0; x < dstW; x++ {
 		left := int(ct.left[x])
 		off := int(ct.off[x])
 		n := int(ct.cnt[x])
-		ws := ct.w[off : off+n]
 
-		var acc float32
+		var acc int32
+		wi := off
+		si := left
 		for i := 0; i < n; i++ {
-			acc += float32(src[left+i]) * ws[i]
+			acc += int32(src[si]) * int32(ct.wQ15[wi])
+			si++
+			wi++
 		}
-		if acc < 0 {
-			acc = 0
-		} else if acc > 255 {
-			acc = 255
+		v := int32((acc + ROUND) >> SHIFT)
+		if v < 0 {
+			v = 0
+		} else if v > 255 {
+			v = 255
 		}
-		dst[x] = byte(acc + 0.5)
+		dst[x] = byte(v)
 	}
 }
 
-// RGB -> RGBA (alpha const)
-func resampleRGBtoRGBAInto(dst []byte, dstW int, src []byte, srcW int, f Filter, alpha byte) {
+func resampleRGBtoRGBAIntoQ15(dst []byte, dstW int, src []byte, srcW int, f Filter, alpha byte) {
 	if dstW <= 0 || srcW <= 0 {
 		return
 	}
-	ct := getCoeffTable(srcW, dstW, f)
+	ct := getCoeffTableQ15(srcW, dstW, f)
+	const SHIFT = 15
+	const ROUND = 1 << (SHIFT - 1)
 	for x := 0; x < dstW; x++ {
 		left := int(ct.left[x])
 		off := int(ct.off[x])
 		n := int(ct.cnt[x])
-		ws := ct.w[off : off+n]
 
-		var r, g, b float32
+		var r, g, b int32
 		si := left * 3
+		wi := off
 		for i := 0; i < n; i++ {
-			w := ws[i]
-			r += float32(src[si+0]) * w
-			g += float32(src[si+1]) * w
-			b += float32(src[si+2]) * w
+			w := int32(ct.wQ15[wi])
+			r += int32(src[si+0]) * w
+			g += int32(src[si+1]) * w
+			b += int32(src[si+2]) * w
 			si += 3
+			wi++
+		}
+		R := (r + ROUND) >> SHIFT
+		G := (g + ROUND) >> SHIFT
+		B := (b + ROUND) >> SHIFT
+		if R < 0 {
+			R = 0
+		} else if R > 255 {
+			R = 255
+		}
+		if G < 0 {
+			G = 0
+		} else if G > 255 {
+			G = 255
+		}
+		if B < 0 {
+			B = 0
+		} else if B > 255 {
+			B = 255
 		}
 		i := x * 4
-		if r < 0 {
-			r = 0
-		} else if r > 255 {
-			r = 255
-		}
-		if g < 0 {
-			g = 0
-		} else if g > 255 {
-			g = 255
-		}
-		if b < 0 {
-			b = 0
-		} else if b > 255 {
-			b = 255
-		}
-		dst[i+0] = byte(r + 0.5)
-		dst[i+1] = byte(g + 0.5)
-		dst[i+2] = byte(b + 0.5)
+		dst[i+0] = byte(R)
+		dst[i+1] = byte(G)
+		dst[i+2] = byte(B)
 		dst[i+3] = alpha
 	}
 }
 
-// Premultiplied RGBA -> RGBA (correct alpha handling)
-func resampleRGBAPremulInto(dst []byte, dstW int, src []byte, srcW int, f Filter) {
+func resampleRGBAPremulIntoQ15(dst []byte, dstW int, src []byte, srcW int, f Filter) {
 	if dstW <= 0 || srcW <= 0 {
 		return
 	}
-	ct := getCoeffTable(srcW, dstW, f)
+	ct := getCoeffTableQ15(srcW, dstW, f)
 	for x := 0; x < dstW; x++ {
 		left := int(ct.left[x])
 		off := int(ct.off[x])
 		n := int(ct.cnt[x])
-		ws := ct.w[off : off+n]
 
-		var ar, ag, ab, aa float32
+		var ar, ag, ab, aa int64
 		si := left * 4
+		wi := off
 		for i := 0; i < n; i++ {
-			w := ws[i]
-			a := float32(src[si+3])
-			aa += a * w
-			aw := a * w
-			ar += float32(src[si+0]) * aw
-			ag += float32(src[si+1]) * aw
-			ab += float32(src[si+2]) * aw
+			w := int64(ct.wQ15[wi])     // Q15
+			a := int64(src[si+3])       // 0..255
+			aa += a * w                 // Q15*alpha
+			aw := a * w                 // Q15*alpha
+			ar += int64(src[si+0]) * aw // Q15*(r*a)
+			ag += int64(src[si+1]) * aw
+			ab += int64(src[si+2]) * aw
 			si += 4
+			wi++
 		}
-		var R, G, B float32
+		var R, G, B, A int64
+		A = (aa + (1 << 14)) >> 15 // scale back to 0..255 with rounding
 		if aa > 0 {
-			invA := 1.0 / aa
-			R, G, B = ar*invA, ag*invA, ab*invA
+			// R = (ar/aa) with rounding
+			R = (ar + aa/2) / aa
+			G = (ag + aa/2) / aa
+			B = (ab + aa/2) / aa
+		} else {
+			R, G, B = 0, 0, 0
 		}
 		if R < 0 {
 			R = 0
@@ -274,47 +324,50 @@ func resampleRGBAPremulInto(dst []byte, dstW int, src []byte, srcW int, f Filter
 		} else if B > 255 {
 			B = 255
 		}
-		if aa < 0 {
-			aa = 0
-		} else if aa > 255 {
-			aa = 255
+		if A < 0 {
+			A = 0
+		} else if A > 255 {
+			A = 255
 		}
 		i := x * 4
-		dst[i+0] = byte(R + 0.5)
-		dst[i+1] = byte(G + 0.5)
-		dst[i+2] = byte(B + 0.5)
-		dst[i+3] = byte(aa + 0.5)
+		dst[i+0] = byte(R)
+		dst[i+1] = byte(G)
+		dst[i+2] = byte(B)
+		dst[i+3] = byte(A)
 	}
 }
 
-// Gray (1 chan) -> RGBA (4 chan) with constant alpha.
-// dst must have capacity >= dstW*4. src is len == srcW.
-// Uses the prebuilt coeff table; no per-pixel allocs.
-func resampleGrayToRGBAInto(dst []byte, dstW int, src []byte, srcW int, f Filter, alpha byte) {
+func resampleGrayToRGBAIntoQ15(dst []byte, dstW int, src []byte, srcW int, f Filter, alpha byte) {
 	if dstW <= 0 || srcW <= 0 {
 		return
 	}
-	ct := getCoeffTable(srcW, dstW, f)
+	ct := getCoeffTableQ15(srcW, dstW, f)
+	const SHIFT = 15
+	const ROUND = 1 << (SHIFT - 1)
 	for x := 0; x < dstW; x++ {
 		left := int(ct.left[x])
 		off := int(ct.off[x])
 		n := int(ct.cnt[x])
-		ws := ct.w[off : off+n]
 
-		var v float32
+		var v int32
+		wi := off
+		si := left
 		for i := 0; i < n; i++ {
-			v += float32(src[left+i]) * ws[i]
+			v += int32(src[si]) * int32(ct.wQ15[wi])
+			si++
+			wi++
 		}
-		if v < 0 {
-			v = 0
-		} else if v > 255 {
-			v = 255
+		V := (v + ROUND) >> SHIFT
+		if V < 0 {
+			V = 0
+		} else if V > 255 {
+			V = 255
 		}
-		iv := byte(v + 0.5)
-		i := x * 4
-		dst[i+0] = iv
-		dst[i+1] = iv
-		dst[i+2] = iv
-		dst[i+3] = alpha
+		iv := byte(V)
+		di := x * 4
+		dst[di+0] = iv
+		dst[di+1] = iv
+		dst[di+2] = iv
+		dst[di+3] = alpha
 	}
 }

@@ -636,7 +636,7 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 					// We resample as 1 channel, then expand to RGBA in-place per pixel.
 					// For minimal changes, do direct 1->4 resampling with alpha filled to 255,
 					// then set 0 where gray == t.
-					resampleGrayToRGBAInto(row[:dstW*4], dstW, cdat, width, *TargetFilter, 0xff)
+					resampleGrayToRGBAIntoQ15(row[:dstW*4], dstW, cdat, width, *TargetFilter, 0xff)
 					for x := 0; x < dstW; x++ {
 						i := x * 4
 						v := row[i+0] // R=G=B
@@ -652,7 +652,7 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 				} else {
 					// Pure gray -> gray
 					row := gray.Pix[pixOffset : pixOffset+gray.Stride]
-					resampleGrayRowInto(row[:dstW], dstW, cdat, width, *TargetFilter)
+					resampleGrayRowIntoQ15(row[:dstW], dstW, cdat, width, *TargetFilter)
 					for k := dstW; k < gray.Rect.Dx(); k++ {
 						row[k] = 0
 					}
@@ -694,7 +694,7 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 					tr, tg, tb := d.transparent[1], d.transparent[3], d.transparent[5]
 					row := nrgba.Pix[pixOffset : pixOffset+nrgba.Stride]
 					// Resample RGB channels:
-					resampleRGBtoRGBAInto(row[:dstW*4], dstW, cdat, width, *TargetFilter, 0xff)
+					resampleRGBtoRGBAIntoQ15(row[:dstW*4], dstW, cdat, width, *TargetFilter, 0xff)
 					// Fix alpha using tRNS on the *resampled* RGB:
 					for x := 0; x < dstW; x++ {
 						i := x * 4
@@ -712,7 +712,7 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 				} else {
 					// RGB -> RGBA, constant alpha 255
 					row := rgba.Pix[pixOffset : pixOffset+rgba.Stride]
-					resampleRGBtoRGBAInto(row[:dstW*4], dstW, cdat, width, *TargetFilter, 0xff)
+					resampleRGBtoRGBAIntoQ15(row[:dstW*4], dstW, cdat, width, *TargetFilter, 0xff)
 					for k := dstW * 4; k < rgba.Rect.Dx()*4; k++ {
 						row[k] = 0
 					}
@@ -801,7 +801,7 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 		case cbTCA8:
 			if TargetWidth > 0 && TargetWidth < width && TargetFilter != nil {
 				row := nrgba.Pix[pixOffset : pixOffset+nrgba.Stride]
-				resampleRGBAPremulInto(row[:TargetWidth*4], TargetWidth, cdat, width, *TargetFilter)
+				resampleRGBAPremulIntoQ15(row[:TargetWidth*4], TargetWidth, cdat, width, *TargetFilter)
 				for k := TargetWidth * 4; k < nrgba.Rect.Dx()*4; k++ {
 					row[k] = 0
 				}
