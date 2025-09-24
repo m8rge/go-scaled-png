@@ -1,6 +1,7 @@
 package pngscaled
 
 import (
+	"image"
 	"math"
 	"sync"
 )
@@ -8,23 +9,19 @@ import (
 // Q15 fixed-point weights table: one build per (srcW, dstW, filter.Support).
 // We store weights in int16 where 1.0 == 32768 (1<<15). Per-pixel weights sum to 32768.
 type coeffTableQ15 struct {
-	srcW, dstW int
-	scale      float64
-	support    float64
-	left       []int32  // len == dstW
-	off        []int32  // len == dstW, offset into wQ15
-	cnt        []uint16 // len == dstW, number of taps
-	wQ15       []int16  // flat weights, all pixels concatenated
+	scale float64
+	left  []int32  // len == dstW
+	off   []int32  // len == dstW, offset into wQ15
+	cnt   []uint16 // len == dstW, number of taps
+	wQ15  []int16  // flat weights, all pixels concatenated
 }
 
 func buildCoeffTableFlatQ15(srcW, dstW int, f ResampleFilter) *coeffTableQ15 {
 	ct := &coeffTableQ15{
-		srcW: srcW, dstW: dstW,
-		scale:   float64(srcW) / float64(dstW),
-		support: f.Support,
-		left:    make([]int32, dstW),
-		off:     make([]int32, dstW),
-		cnt:     make([]uint16, dstW),
+		scale: float64(srcW) / float64(dstW),
+		left:  make([]int32, dstW),
+		off:   make([]int32, dstW),
+		cnt:   make([]uint16, dstW),
 	}
 	supp := f.Support * ct.scale
 
@@ -139,12 +136,116 @@ func buildCoeffTableFlatQ15(srcW, dstW int, f ResampleFilter) *coeffTableQ15 {
 	return ct
 }
 
+// Build (or reuse) vertical Q15 coefficients.
+// Reuses coeffTableQ15 shape: left/off/cnt are sized for dstH, wQ15 is flat.
+func getCoeffTableQ15Y(srcH, dstH int, f ResampleFilter) *coeffTableQ15 {
+	if srcH <= 0 || dstH <= 0 {
+		return nil
+	}
+	coeffCacheQ15YMu.Lock()
+	cached := coeffCacheQ15Y.ct != nil &&
+		coeffCacheQ15Y.srcH == srcH &&
+		coeffCacheQ15Y.dstH == dstH &&
+		coeffCacheQ15Y.support == f.Support
+	var ct *coeffTableQ15
+	if cached {
+		ct = coeffCacheQ15Y.ct
+		coeffCacheQ15YMu.Unlock()
+		return ct
+	}
+	coeffCacheQ15YMu.Unlock()
+
+	scale := float64(srcH) / float64(dstH) // >1 for downscale
+	sup := f.Support
+
+	left := make([]int32, dstH)
+	off := make([]int32, dstH)
+	cnt := make([]uint16, dstH)
+	wQ15 := make([]int16, 0, dstH*int(2*math.Ceil(sup*scale)+3)) // rough cap
+
+	wOffset := 0
+	for y := 0; y < dstH; y++ {
+		// Map dest center to source space (same convention as X path)
+		yc := (float64(y)+0.5)*scale - 0.5
+
+		start := int(math.Ceil(yc - sup*scale))
+		end := int(math.Floor(yc + sup*scale))
+		if start < 0 {
+			start = 0
+		}
+		if end > srcH-1 {
+			end = srcH - 1
+		}
+		if end < start {
+			end = start
+		}
+		n := end - start + 1
+
+		// Float normalization
+		sum := 0.0
+		for s := start; s <= end; s++ {
+			t := (yc - float64(s)) / scale
+			sum += f.Kernel(t)
+		}
+		if sum == 0 {
+			sum = 1
+		}
+
+		sumQ := int32(0)
+		rowOff := wOffset
+		for s := start; s <= end; s++ {
+			t := (yc - float64(s)) / scale
+			w := f.Kernel(t) / sum
+			q := int32(math.Round(w * 32768.0))
+			if q < -32768 {
+				q = -32768
+			}
+			if q > 32767 {
+				q = 32767
+			}
+			wQ15 = append(wQ15, int16(q))
+			wOffset++
+			sumQ += q
+		}
+		// Fix rounding on the last tap so Σw == 32768
+		if n > 0 && sumQ != 32768 {
+			wQ15[wOffset-1] = int16(int32(wQ15[wOffset-1]) + (32768 - sumQ))
+		}
+
+		left[y] = int32(start)
+		off[y] = int32(rowOff)
+		cnt[y] = uint16(n)
+	}
+
+	ct = &coeffTableQ15{
+		scale: scale,
+		left:  left,
+		off:   off,
+		cnt:   cnt,
+		wQ15:  wQ15,
+	}
+
+	coeffCacheQ15YMu.Lock()
+	coeffCacheQ15Y.srcH = srcH
+	coeffCacheQ15Y.dstH = dstH
+	coeffCacheQ15Y.support = sup
+	coeffCacheQ15Y.ct = ct
+	coeffCacheQ15YMu.Unlock()
+	return ct
+}
+
 var (
 	coeffCacheQ15Mu sync.Mutex
 	coeffCacheQ15   struct {
 		srcW, dstW int
 		support    float64
 		ct         *coeffTableQ15
+	}
+	coeffCacheQ15YMu sync.Mutex
+	coeffCacheQ15Y   struct {
+		srcH, dstH int
+		support    float64
+		ct         *coeffTableQ15 // left/off/cnt sized to dstH; wQ15 concatenated
 	}
 )
 
@@ -345,4 +446,126 @@ func resampleGrayToRGBAIntoQ15(dst []byte, dstW int, src []byte, srcW int, f Res
 		dst[di+2] = iv
 		dst[di+3] = alpha
 	}
+}
+
+// -----------------------------------------------------------------------------
+// Vertical coefficient cache (Q15)
+
+func clamp8(v int32) byte {
+	if v < 0 {
+		return 0
+	}
+	if v > 255 {
+		return 255
+	}
+	return byte(v)
+}
+
+// RGBA (straight alpha)
+func VerticalRGBAInPlaceQ15(img *image.RGBA, dstH int, f ResampleFilter) {
+	if img == nil || dstH <= 0 || dstH >= img.Rect.Dy() {
+		return
+	}
+	srcH, w, stride := img.Rect.Dy(), img.Rect.Dx(), img.Stride
+	ct := getCoeffTableQ15Y(srcH, dstH, f)
+	buf := make([]byte, 4*dstH)
+
+	for x := 0; x < w; x++ {
+		for yd := 0; yd < dstH; yd++ {
+			start := int(ct.left[yd])
+			n := int(ct.cnt[yd])
+			wi := int(ct.off[yd])
+
+			var r, g, b, a int32
+			for k := 0; k < n; k++ {
+				q := int32(ct.wQ15[wi+k])
+				p := img.Pix[(start+k)*stride+4*x:]
+				r += int32(p[0]) * q
+				g += int32(p[1]) * q
+				b += int32(p[2]) * q
+				a += int32(p[3]) * q
+			}
+			i := 4 * yd
+			buf[i+0] = clamp8((r + 16384) >> 15)
+			buf[i+1] = clamp8((g + 16384) >> 15)
+			buf[i+2] = clamp8((b + 16384) >> 15)
+			buf[i+3] = clamp8((a + 16384) >> 15)
+		}
+		for yd := 0; yd < dstH; yd++ {
+			copy(img.Pix[yd*stride+4*x:], buf[4*yd:4*yd+4])
+		}
+	}
+	r := img.Rect
+	r.Max.Y = r.Min.Y + dstH
+	img.Rect = r
+}
+
+// NRGBA (premultiplied alpha preserved)
+func VerticalNRGBAInPlaceQ15(img *image.NRGBA, dstH int, f ResampleFilter) {
+	if img == nil || dstH <= 0 || dstH >= img.Rect.Dy() {
+		return
+	}
+	srcH, w, stride := img.Rect.Dy(), img.Rect.Dx(), img.Stride
+	ct := getCoeffTableQ15Y(srcH, dstH, f)
+	buf := make([]byte, 4*dstH)
+
+	for x := 0; x < w; x++ {
+		for yd := 0; yd < dstH; yd++ {
+			start := int(ct.left[yd])
+			n := int(ct.cnt[yd])
+			wi := int(ct.off[yd])
+
+			var r, g, b, a int32
+			for k := 0; k < n; k++ {
+				q := int32(ct.wQ15[wi+k])
+				p := img.Pix[(start+k)*stride+4*x:]
+				r += int32(p[0]) * q
+				g += int32(p[1]) * q
+				b += int32(p[2]) * q
+				a += int32(p[3]) * q
+			}
+			i := 4 * yd
+			buf[i+0] = clamp8((r + 16384) >> 15)
+			buf[i+1] = clamp8((g + 16384) >> 15)
+			buf[i+2] = clamp8((b + 16384) >> 15)
+			buf[i+3] = clamp8((a + 16384) >> 15)
+		}
+		for yd := 0; yd < dstH; yd++ {
+			copy(img.Pix[yd*stride+4*x:], buf[4*yd:4*yd+4])
+		}
+	}
+	r := img.Rect
+	r.Max.Y = r.Min.Y + dstH
+	img.Rect = r
+}
+
+// Gray (8-bit)
+func VerticalGrayInPlaceQ15(img *image.Gray, dstH int, f ResampleFilter) {
+	if img == nil || dstH <= 0 || dstH >= img.Rect.Dy() {
+		return
+	}
+	srcH, w, stride := img.Rect.Dy(), img.Rect.Dx(), img.Stride
+	ct := getCoeffTableQ15Y(srcH, dstH, f)
+	buf := make([]byte, dstH)
+
+	for x := 0; x < w; x++ {
+		for yd := 0; yd < dstH; yd++ {
+			start := int(ct.left[yd])
+			n := int(ct.cnt[yd])
+			wi := int(ct.off[yd])
+
+			var acc int32
+			for k := 0; k < n; k++ {
+				q := int32(ct.wQ15[wi+k])
+				acc += int32(img.Pix[(start+k)*stride+x]) * q
+			}
+			buf[yd] = clamp8((acc + 16384) >> 15)
+		}
+		for yd := 0; yd < dstH; yd++ {
+			img.Pix[yd*stride+x] = buf[yd]
+		}
+	}
+	r := img.Rect
+	r.Max.Y = r.Min.Y + dstH
+	img.Rect = r
 }

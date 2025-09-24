@@ -17,7 +17,7 @@ func TestShrink(t *testing.T) {
 	for i, name := range names {
 		data, err := os.Open(name)
 		require.NoError(t, err)
-		image, err := Decode(data, 400, 0, Lanczos)
+		image, err := Decode(data, 120, 100, MitchellNetravali)
 		require.NoError(t, err)
 
 		file, err := os.Create(outNames[i])
@@ -43,7 +43,7 @@ func BenchmarkShrink(b *testing.B) {
 		for _, file := range files {
 			file.Seek(0, 0)
 
-			_, err := Decode(file, 400, 0, Lanczos)
+			_, err := Decode(file, 120, 100, MitchellNetravali)
 			require.NoError(b, err)
 		}
 	}
@@ -67,7 +67,7 @@ func BenchmarkShrinkInitial(b *testing.B) {
 
 			image, err := png.Decode(file)
 			require.NoError(b, err)
-			_ = imaging.Resize(image, 400, image.Bounds().Dy(), imaging.Lanczos)
+			_ = imaging.Resize(image, 120, 100, imaging.MitchellNetravali)
 		}
 	}
 }

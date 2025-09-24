@@ -872,6 +872,17 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 		pr, cr = cr, pr
 	}
 
+	if d.targetHeight > 0 && d.targetHeight < d.height {
+		switch im := img.(type) {
+		case *image.RGBA:
+			VerticalRGBAInPlaceQ15(im, d.targetHeight, d.filter)
+		case *image.NRGBA:
+			VerticalNRGBAInPlaceQ15(im, d.targetHeight, d.filter)
+		case *image.Gray:
+			VerticalGrayInPlaceQ15(im, d.targetHeight, d.filter)
+		}
+	}
+
 	return img, nil
 }
 
