@@ -18,6 +18,11 @@ import (
 	"io"
 )
 
+type Config struct {
+	image.Config
+	Interlaced bool
+}
+
 // Color type, as per the PNG spec.
 const (
 	ctGrayscale      = 0
@@ -439,7 +444,7 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 		}
 	}
 	rect := image.Rect(0, 0, width, height)
-	if d.targetWidth > 0 && d.targetWidth < width {
+	if d.targetWidth > 0 && d.targetWidth < width && d.interlace == itNone {
 		rect = image.Rect(0, 0, d.targetWidth, height)
 	}
 	switch d.cb {
@@ -630,7 +635,7 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 			}
 		case cbG8:
 			// Gray 8-bit, optional tRNS
-			if d.targetWidth > 0 && d.targetWidth < width {
+			if d.targetWidth > 0 && d.targetWidth < width && d.interlace == itNone {
 				dstW := d.targetWidth
 				if d.useTransparent {
 					// Gray+tRNS -> NRGBA
@@ -664,8 +669,8 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 					break
 				}
 			}
-			// fall through to original cbG8 if no shrink/filter
-			// -------------------------------------------------------------------------------
+
+			// fall through to original cbG8
 			if d.useTransparent {
 				ty := d.transparent[1]
 				for x := 0; x < width; x++ {
@@ -687,7 +692,7 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 			}
 		case cbTC8:
 			// RGB 8-bit, optional tRNS -> write into RGBA/NRGBA.
-			if d.targetWidth > 0 && d.targetWidth < width {
+			if d.targetWidth > 0 && d.targetWidth < width && d.interlace == itNone {
 				dstW := d.targetWidth
 				if d.useTransparent {
 					// tRNS => NRGBA, alpha=0 where RGB matches transparent key.
@@ -720,6 +725,7 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 					break
 				}
 			}
+
 			// fall through to original cbTC8 if no shrink/filter
 			if d.useTransparent {
 				pix, i, j := nrgba.Pix, pixOffset, 0
@@ -799,7 +805,7 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 			copy(paletted.Pix[pixOffset:], cdat)
 			pixOffset += paletted.Stride
 		case cbTCA8:
-			if d.targetWidth > 0 && d.targetWidth < width {
+			if d.targetWidth > 0 && d.targetWidth < width && d.interlace == itNone {
 				row := nrgba.Pix[pixOffset : pixOffset+nrgba.Stride]
 				resampleRGBAPremulIntoQ15(row[:d.targetWidth*4], d.targetWidth, cdat, width, d.filter)
 				for k := d.targetWidth * 4; k < nrgba.Rect.Dx()*4; k++ {
@@ -808,8 +814,8 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 				pixOffset += nrgba.Stride
 				break
 			}
-			// fall through to original cbTCA8...
 
+			// fall through to original cbTCA8...
 			copy(nrgba.Pix[pixOffset:], cdat)
 			pixOffset += nrgba.Stride
 		case cbG16:
@@ -872,7 +878,7 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 		pr, cr = cr, pr
 	}
 
-	if d.targetHeight > 0 && d.targetHeight < d.height {
+	if d.targetHeight > 0 && d.targetHeight < d.height && d.interlace == itNone {
 		switch im := img.(type) {
 		case *image.RGBA:
 			VerticalRGBAInPlaceQ15(im, d.targetHeight, d.filter)
@@ -1097,7 +1103,7 @@ func Decode(r io.Reader, targetWidth, targetHeight int, filter ResampleFilter) (
 
 // DecodeConfig returns the color model and dimensions of a PNG image without
 // decoding the entire image.
-func DecodeConfig(r io.Reader) (image.Config, error) {
+func DecodeConfig(r io.Reader) (Config, error) {
 	d := &decoder{
 		r:   r,
 		crc: crc32.NewIEEE(),
@@ -1106,7 +1112,7 @@ func DecodeConfig(r io.Reader) (image.Config, error) {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
 		}
-		return image.Config{}, err
+		return Config{}, err
 	}
 
 	for {
@@ -1114,7 +1120,7 @@ func DecodeConfig(r io.Reader) (image.Config, error) {
 			if err == io.EOF {
 				err = io.ErrUnexpectedEOF
 			}
-			return image.Config{}, err
+			return Config{}, err
 		}
 
 		if cbPaletted(d.cb) {
@@ -1149,9 +1155,13 @@ func DecodeConfig(r io.Reader) (image.Config, error) {
 	case cbTCA16:
 		cm = color.NRGBA64Model
 	}
-	return image.Config{
-		ColorModel: cm,
-		Width:      d.width,
-		Height:     d.height,
+
+	return Config{
+		Config: image.Config{
+			ColorModel: cm,
+			Width:      d.width,
+			Height:     d.height,
+		},
+		Interlaced: d.interlace != itNone,
 	}, nil
 }

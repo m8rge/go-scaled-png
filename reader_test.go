@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
+	"image/png"
 	"io"
 	"os"
 	"reflect"
@@ -865,6 +867,56 @@ func BenchmarkDecodeNRGBAGradient(b *testing.B) {
 
 func BenchmarkDecodeNRGBAOpaque(b *testing.B) {
 	benchmarkDecode(b, "testdata/benchNRGBA-opaque.png", 4)
+}
+
+func TestDecodeMatchesStdLibForIPNG(t *testing.T) {
+	data, err := os.ReadFile("testdata/benchRGB-interlace.png")
+	if err != nil {
+		t.Fatalf("failed to read i.png: %v", err)
+	}
+
+	stdImg, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("failed to decode i.png with stdlib: %v", err)
+	}
+
+	scaledImg, err := Decode(bytes.NewReader(data), 0, 0, MitchellNetravali)
+	if err != nil {
+		t.Fatalf("failed to decode i.png with pngscaled: %v", err)
+	}
+
+	stdNRGBA := imageToNRGBA(stdImg)
+	scaledNRGBA := imageToNRGBA(scaledImg)
+
+	if stdNRGBA.Bounds() != scaledNRGBA.Bounds() {
+		t.Fatalf("decoded bounds differ: std=%v pngscaled=%v", stdNRGBA.Bounds(), scaledNRGBA.Bounds())
+	}
+	if stdNRGBA.Stride != scaledNRGBA.Stride {
+		t.Fatalf("decoded stride differs: std=%d pngscaled=%d", stdNRGBA.Stride, scaledNRGBA.Stride)
+	}
+	if !bytes.Equal(stdNRGBA.Pix, scaledNRGBA.Pix) {
+		diffIdx := -1
+		for i := range stdNRGBA.Pix {
+			if stdNRGBA.Pix[i] != scaledNRGBA.Pix[i] {
+				diffIdx = i
+				break
+			}
+		}
+		if diffIdx >= 0 {
+			x := (diffIdx / 4) % stdNRGBA.Rect.Dx()
+			y := (diffIdx / 4) / stdNRGBA.Rect.Dx()
+			t.Fatalf("decoded pixel data differs at (%d,%d): std=%v pngscaled=%v", x, y,
+				stdNRGBA.Pix[diffIdx:diffIdx+4], scaledNRGBA.Pix[diffIdx:diffIdx+4])
+		}
+		t.Fatal("decoded pixel data differs between stdlib and pngscaled")
+	}
+}
+
+func imageToNRGBA(img image.Image) *image.NRGBA {
+	bounds := img.Bounds()
+	dst := image.NewNRGBA(bounds)
+	draw.Draw(dst, bounds, img, bounds.Min, draw.Src)
+	return dst
 }
 
 func BenchmarkDecodePaletted(b *testing.B) {

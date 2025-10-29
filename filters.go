@@ -33,9 +33,6 @@ type ResampleFilter struct {
 	Kernel  func(float64) float64
 }
 
-// NearestNeighbor is a nearest-neighbor filter (no anti-aliasing).
-var NearestNeighbor ResampleFilter
-
 // Box filter (averaging pixels).
 var Box ResampleFilter
 
@@ -97,10 +94,6 @@ func sinc(x float64) float64 {
 }
 
 func init() {
-	NearestNeighbor = ResampleFilter{
-		Support: 0.0, // special case - not applying the filter
-	}
-
 	Box = ResampleFilter{
 		Support: 0.5,
 		Kernel: func(x float64) float64 {
