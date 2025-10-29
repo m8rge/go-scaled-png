@@ -249,6 +249,16 @@ var (
 	}
 )
 
+func clamp8(v int32) byte {
+	if v < 0 {
+		return 0
+	}
+	if v > 255 {
+		return 255
+	}
+	return byte(v)
+}
+
 func getCoeffTableQ15(srcW, dstW int, f ResampleFilter) *coeffTableQ15 {
 	coeffCacheQ15Mu.Lock()
 	c := coeffCacheQ15
@@ -292,13 +302,7 @@ func resampleGrayRowIntoQ15(dst []byte, dstW int, src []byte, srcW int, f Resamp
 			si++
 			wi++
 		}
-		v := int32((acc + ROUND) >> SHIFT)
-		if v < 0 {
-			v = 0
-		} else if v > 255 {
-			v = 255
-		}
-		dst[x] = byte(v)
+		dst[x] = clamp8((acc + ROUND) >> SHIFT)
 	}
 }
 
@@ -325,28 +329,10 @@ func resampleRGBtoRGBAIntoQ15(dst []byte, dstW int, src []byte, srcW int, f Resa
 			si += 3
 			wi++
 		}
-		R := (r + ROUND) >> SHIFT
-		G := (g + ROUND) >> SHIFT
-		B := (b + ROUND) >> SHIFT
-		if R < 0 {
-			R = 0
-		} else if R > 255 {
-			R = 255
-		}
-		if G < 0 {
-			G = 0
-		} else if G > 255 {
-			G = 255
-		}
-		if B < 0 {
-			B = 0
-		} else if B > 255 {
-			B = 255
-		}
 		i := x * 4
-		dst[i+0] = byte(R)
-		dst[i+1] = byte(G)
-		dst[i+2] = byte(B)
+		dst[i+0] = clamp8((r + ROUND) >> SHIFT)
+		dst[i+1] = clamp8((g + ROUND) >> SHIFT)
+		dst[i+2] = clamp8((b + ROUND) >> SHIFT)
 		dst[i+3] = alpha
 	}
 }
@@ -385,31 +371,11 @@ func resampleRGBAPremulIntoQ15(dst []byte, dstW int, src []byte, srcW int, f Res
 		} else {
 			R, G, B = 0, 0, 0
 		}
-		if R < 0 {
-			R = 0
-		} else if R > 255 {
-			R = 255
-		}
-		if G < 0 {
-			G = 0
-		} else if G > 255 {
-			G = 255
-		}
-		if B < 0 {
-			B = 0
-		} else if B > 255 {
-			B = 255
-		}
-		if A < 0 {
-			A = 0
-		} else if A > 255 {
-			A = 255
-		}
 		i := x * 4
-		dst[i+0] = byte(R)
-		dst[i+1] = byte(G)
-		dst[i+2] = byte(B)
-		dst[i+3] = byte(A)
+		dst[i+0] = clamp8(int32(R))
+		dst[i+1] = clamp8(int32(G))
+		dst[i+2] = clamp8(int32(B))
+		dst[i+3] = clamp8(int32(A))
 	}
 }
 
@@ -433,13 +399,7 @@ func resampleGrayToRGBAIntoQ15(dst []byte, dstW int, src []byte, srcW int, f Res
 			si++
 			wi++
 		}
-		V := (v + ROUND) >> SHIFT
-		if V < 0 {
-			V = 0
-		} else if V > 255 {
-			V = 255
-		}
-		iv := byte(V)
+		iv := clamp8((v + ROUND) >> SHIFT)
 		di := x * 4
 		dst[di+0] = iv
 		dst[di+1] = iv
@@ -448,17 +408,37 @@ func resampleGrayToRGBAIntoQ15(dst []byte, dstW int, src []byte, srcW int, f Res
 	}
 }
 
-// -----------------------------------------------------------------------------
-// Vertical coefficient cache (Q15)
+func verticalRGBAColumnsQ15(pix []byte, stride, width, dstH int, ct *coeffTableQ15) {
+	if ct == nil || dstH <= 0 {
+		return
+	}
+	buf := make([]byte, 4*dstH)
+	for x := 0; x < width; x++ {
+		colOffset := 4 * x
+		for yd := 0; yd < dstH; yd++ {
+			start := int(ct.left[yd])
+			n := int(ct.cnt[yd])
+			wi := int(ct.off[yd])
 
-func clamp8(v int32) byte {
-	if v < 0 {
-		return 0
+			var r, g, b, a int32
+			for k := 0; k < n; k++ {
+				q := int32(ct.wQ15[wi+k])
+				p := pix[(start+k)*stride+colOffset:]
+				r += int32(p[0]) * q
+				g += int32(p[1]) * q
+				b += int32(p[2]) * q
+				a += int32(p[3]) * q
+			}
+			i := 4 * yd
+			buf[i+0] = clamp8((r + 16384) >> 15)
+			buf[i+1] = clamp8((g + 16384) >> 15)
+			buf[i+2] = clamp8((b + 16384) >> 15)
+			buf[i+3] = clamp8((a + 16384) >> 15)
+		}
+		for yd := 0; yd < dstH; yd++ {
+			copy(pix[yd*stride+colOffset:], buf[4*yd:4*yd+4])
+		}
 	}
-	if v > 255 {
-		return 255
-	}
-	return byte(v)
 }
 
 // RGBA (straight alpha)
@@ -468,36 +448,8 @@ func VerticalRGBAInPlaceQ15(img *image.RGBA, dstH int, f ResampleFilter) {
 	}
 	srcH, w, stride := img.Rect.Dy(), img.Rect.Dx(), img.Stride
 	ct := getCoeffTableQ15Y(srcH, dstH, f)
-	buf := make([]byte, 4*dstH)
-
-	for x := 0; x < w; x++ {
-		for yd := 0; yd < dstH; yd++ {
-			start := int(ct.left[yd])
-			n := int(ct.cnt[yd])
-			wi := int(ct.off[yd])
-
-			var r, g, b, a int32
-			for k := 0; k < n; k++ {
-				q := int32(ct.wQ15[wi+k])
-				p := img.Pix[(start+k)*stride+4*x:]
-				r += int32(p[0]) * q
-				g += int32(p[1]) * q
-				b += int32(p[2]) * q
-				a += int32(p[3]) * q
-			}
-			i := 4 * yd
-			buf[i+0] = clamp8((r + 16384) >> 15)
-			buf[i+1] = clamp8((g + 16384) >> 15)
-			buf[i+2] = clamp8((b + 16384) >> 15)
-			buf[i+3] = clamp8((a + 16384) >> 15)
-		}
-		for yd := 0; yd < dstH; yd++ {
-			copy(img.Pix[yd*stride+4*x:], buf[4*yd:4*yd+4])
-		}
-	}
-	r := img.Rect
-	r.Max.Y = r.Min.Y + dstH
-	img.Rect = r
+	verticalRGBAColumnsQ15(img.Pix, stride, w, dstH, ct)
+	img.Rect.Max.Y = img.Rect.Min.Y + dstH
 }
 
 // NRGBA (premultiplied alpha preserved)
@@ -507,36 +459,8 @@ func VerticalNRGBAInPlaceQ15(img *image.NRGBA, dstH int, f ResampleFilter) {
 	}
 	srcH, w, stride := img.Rect.Dy(), img.Rect.Dx(), img.Stride
 	ct := getCoeffTableQ15Y(srcH, dstH, f)
-	buf := make([]byte, 4*dstH)
-
-	for x := 0; x < w; x++ {
-		for yd := 0; yd < dstH; yd++ {
-			start := int(ct.left[yd])
-			n := int(ct.cnt[yd])
-			wi := int(ct.off[yd])
-
-			var r, g, b, a int32
-			for k := 0; k < n; k++ {
-				q := int32(ct.wQ15[wi+k])
-				p := img.Pix[(start+k)*stride+4*x:]
-				r += int32(p[0]) * q
-				g += int32(p[1]) * q
-				b += int32(p[2]) * q
-				a += int32(p[3]) * q
-			}
-			i := 4 * yd
-			buf[i+0] = clamp8((r + 16384) >> 15)
-			buf[i+1] = clamp8((g + 16384) >> 15)
-			buf[i+2] = clamp8((b + 16384) >> 15)
-			buf[i+3] = clamp8((a + 16384) >> 15)
-		}
-		for yd := 0; yd < dstH; yd++ {
-			copy(img.Pix[yd*stride+4*x:], buf[4*yd:4*yd+4])
-		}
-	}
-	r := img.Rect
-	r.Max.Y = r.Min.Y + dstH
-	img.Rect = r
+	verticalRGBAColumnsQ15(img.Pix, stride, w, dstH, ct)
+	img.Rect.Max.Y = img.Rect.Min.Y + dstH
 }
 
 // Gray (8-bit)
@@ -565,7 +489,5 @@ func VerticalGrayInPlaceQ15(img *image.Gray, dstH int, f ResampleFilter) {
 			img.Pix[yd*stride+x] = buf[yd]
 		}
 	}
-	r := img.Rect
-	r.Max.Y = r.Min.Y + dstH
-	img.Rect = r
+	img.Rect.Max.Y = img.Rect.Min.Y + dstH
 }
