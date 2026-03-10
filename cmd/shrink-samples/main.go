@@ -20,7 +20,7 @@ import (
 	"os"
 	"path/filepath"
 
-	pngscaled "go-scaled-png"
+	pngscaled "github.com/m8rge/go-scaled-png"
 )
 
 func main() {

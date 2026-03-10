@@ -1,4 +1,4 @@
-module go-scaled-png
+module github.com/m8rge/go-scaled-png
 
 go 1.25
 

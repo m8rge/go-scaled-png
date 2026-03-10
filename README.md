@@ -3,6 +3,12 @@
 A PNG decoder that scales images down **while decoding**, avoiding the
 memory cost of allocating a full-size intermediate image.
 
+## Installation
+
+```bash
+go get github.com/m8rge/go-scaled-png
+```
+
 ## How it works
 
 The standard approach — `png.Decode` then `imaging.Resize` — allocates the
@@ -20,7 +26,7 @@ input size.
 ## API
 
 ```go
-import pngscaled "go-scaled-png"
+import pngscaled "github.com/m8rge/go-scaled-png"
 
 img, err := pngscaled.Decode(r, targetWidth, targetHeight, pngscaled.MitchellNetravali)
 ```
