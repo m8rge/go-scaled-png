@@ -869,18 +869,18 @@ func BenchmarkDecodeNRGBAOpaque(b *testing.B) {
 	benchmarkDecode(b, "testdata/benchNRGBA-opaque.png", 4)
 }
 
-func TestDecodeMatchesStdLibForIPNG(t *testing.T) {
+func TestDecodeInterlacedResized(t *testing.T) {
 	data, err := os.ReadFile("testdata/benchRGB-interlace.png")
 	if err != nil {
-		t.Fatalf("failed to read i.png: %v", err)
+		t.Fatal(err)
 	}
 
 	stdImg, err := png.Decode(bytes.NewReader(data))
 	if err != nil {
-		t.Fatalf("failed to decode i.png with stdlib: %v", err)
+		t.Fatal(err)
 	}
 
-	scaledImg, err := Decode(bytes.NewReader(data), 0, 0, MitchellNetravali)
+	scaledImg, err := Decode(bytes.NewReader(data), 10, 10, MitchellNetravali)
 	if err != nil {
 		t.Fatalf("failed to decode i.png with pngscaled: %v", err)
 	}

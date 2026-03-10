@@ -408,6 +408,41 @@ func resampleGrayToRGBAIntoQ15(dst []byte, dstW int, src []byte, srcW int, f Res
 	}
 }
 
+func resampleGrayAlphaPremulIntoNRGBAQ15(dst []byte, dstW int, src []byte, srcW int, f ResampleFilter) {
+	if dstW <= 0 || srcW <= 0 {
+		return
+	}
+	ct := getCoeffTableQ15(srcW, dstW, f)
+	for x := 0; x < dstW; x++ {
+		left := int(ct.left[x])
+		off := int(ct.off[x])
+		n := int(ct.cnt[x])
+
+		var aa, ag int64
+		si := left * 2
+		wi := off
+		for i := 0; i < n; i++ {
+			w := int64(ct.wQ15[wi]) // Q15
+			a := int64(src[si+1])   // 0..255
+			aa += a * w
+			ag += int64(src[si+0]) * a * w
+			si += 2
+			wi++
+		}
+		var G, A int64
+		A = (aa + (1 << 14)) >> 15
+		if aa > 0 {
+			G = (ag + aa/2) / aa
+		}
+		iv := clamp8(int32(G))
+		di := x * 4
+		dst[di+0] = iv
+		dst[di+1] = iv
+		dst[di+2] = iv
+		dst[di+3] = clamp8(int32(A))
+	}
+}
+
 func verticalRGBAColumnsQ15(pix []byte, stride, width, dstH int, ct *coeffTableQ15) {
 	if ct == nil || dstH <= 0 {
 		return

@@ -11,8 +11,8 @@ import (
 )
 
 func TestShrink(t *testing.T) {
-	names := []string{"1.png", "2.png", "3.png"}
-	outNames := []string{"1-out.png", "2-out.png", "3-out.png"}
+	names := []string{"1.png", "2.png", "3.png", "i.png", "4.png"}
+	outNames := []string{"1-out.png", "2-out.png", "3-out.png", "i-out.png", "4-out.png"}
 
 	for i, name := range names {
 		data, err := os.Open(name)
@@ -68,6 +68,51 @@ func BenchmarkShrinkInitial(b *testing.B) {
 			image, err := png.Decode(file)
 			require.NoError(b, err)
 			_ = imaging.Resize(image, 120, 100, imaging.MitchellNetravali)
+		}
+	}
+}
+
+func BenchmarkShrink2(b *testing.B) {
+	runtime.GOMAXPROCS(1)
+
+	names := []string{"4.png"}
+	files := make([]*os.File, len(names))
+	for i, name := range names {
+		data, err := os.Open(name)
+		require.NoError(b, err)
+		files[i] = data
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		for _, file := range files {
+			file.Seek(0, 0)
+
+			_, err := Decode(file, 1920, 1062, MitchellNetravali)
+			require.NoError(b, err)
+		}
+	}
+}
+
+func BenchmarkShrinkInitial2(b *testing.B) {
+	runtime.GOMAXPROCS(1)
+
+	names := []string{"4.png"}
+	files := make([]*os.File, len(names))
+	for i, name := range names {
+		data, err := os.Open(name)
+		require.NoError(b, err)
+		files[i] = data
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		for _, file := range files {
+			file.Seek(0, 0)
+
+			image, err := png.Decode(file)
+			require.NoError(b, err)
+			_ = imaging.Resize(image, 1920, 1062, imaging.MitchellNetravali)
 		}
 	}
 }
