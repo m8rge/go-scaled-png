@@ -13,13 +13,7 @@ func (d *decoder) shrinkRowG8(cdat []byte, nrgba *image.NRGBA, gray *image.Gray,
 	if d.useTransparent {
 		t := d.transparent[1]
 		row := nrgba.Pix[pixOffset : pixOffset+nrgba.Stride]
-		resampleGrayToRGBAIntoQ15(row[:dstW*4], dstW, cdat, width, d.filter, 0xff)
-		for x := 0; x < dstW; x++ {
-			i := x * 4
-			if row[i+0] == t {
-				row[i+3] = 0x00
-			}
-		}
+		resampleGrayTRNSPremulIntoNRGBAQ15(row[:dstW*4], dstW, cdat, width, d.filter, t)
 		for k := dstW * 4; k < nrgba.Rect.Dx()*4; k++ {
 			row[k] = 0
 		}
@@ -53,13 +47,7 @@ func (d *decoder) shrinkRowTC8(cdat []byte, nrgba *image.NRGBA, rgba *image.RGBA
 	if d.useTransparent {
 		tr, tg, tb := d.transparent[1], d.transparent[3], d.transparent[5]
 		row := nrgba.Pix[pixOffset : pixOffset+nrgba.Stride]
-		resampleRGBtoRGBAIntoQ15(row[:dstW*4], dstW, cdat, width, d.filter, 0xff)
-		for x := 0; x < dstW; x++ {
-			i := x * 4
-			if row[i+0] == tr && row[i+1] == tg && row[i+2] == tb {
-				row[i+3] = 0x00
-			}
-		}
+		resampleRGBTRNSPremulIntoNRGBAQ15(row[:dstW*4], dstW, cdat, width, d.filter, tr, tg, tb)
 		return pixOffset + nrgba.Stride
 	}
 	row := rgba.Pix[pixOffset : pixOffset+rgba.Stride]
@@ -89,15 +77,7 @@ func (d *decoder) shrinkRowG16(cdat []byte, nrgba64 *image.NRGBA64, gray16 *imag
 	if d.useTransparent {
 		ty := uint16(d.transparent[0])<<8 | uint16(d.transparent[1])
 		row := nrgba64.Pix[pixOffset : pixOffset+nrgba64.Stride]
-		resampleGray16ToNRGBA64IntoQ15(row[:dstW*8], dstW, cdat, width, d.filter, 0xffff)
-		for x := 0; x < dstW; x++ {
-			i := x * 8
-			y := uint16(row[i])<<8 | uint16(row[i+1])
-			if y == ty {
-				row[i+6] = 0x00
-				row[i+7] = 0x00
-			}
-		}
+		resampleGray16TRNSPremulIntoNRGBA64Q15(row[:dstW*8], dstW, cdat, width, d.filter, ty)
 		return pixOffset + nrgba64.Stride
 	}
 	row := gray16.Pix[pixOffset : pixOffset+gray16.Stride]
@@ -123,17 +103,7 @@ func (d *decoder) shrinkRowTC16(cdat []byte, nrgba64 *image.NRGBA64, rgba64 *ima
 		tg := uint16(d.transparent[2])<<8 | uint16(d.transparent[3])
 		tb := uint16(d.transparent[4])<<8 | uint16(d.transparent[5])
 		row := nrgba64.Pix[pixOffset : pixOffset+nrgba64.Stride]
-		resampleRGB16toRGBA64BytesIntoQ15(row[:dstW*8], dstW, cdat, width, d.filter, 0xffff)
-		for x := 0; x < dstW; x++ {
-			i := x * 8
-			r := uint16(row[i+0])<<8 | uint16(row[i+1])
-			g := uint16(row[i+2])<<8 | uint16(row[i+3])
-			b := uint16(row[i+4])<<8 | uint16(row[i+5])
-			if r == tr && g == tg && b == tb {
-				row[i+6] = 0x00
-				row[i+7] = 0x00
-			}
-		}
+		resampleRGB16TRNSPremulIntoNRGBA64Q15(row[:dstW*8], dstW, cdat, width, d.filter, tr, tg, tb)
 		return pixOffset + nrgba64.Stride
 	}
 	row := rgba64.Pix[pixOffset : pixOffset+rgba64.Stride]

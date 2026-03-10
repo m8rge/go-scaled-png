@@ -521,6 +521,12 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 		rowBuf = make([]byte, width*4)
 	}
 
+	// scratch buffer for sub-byte gray shrink: expand packed bits to 1 byte/pixel before resampling
+	var grayBuf []byte
+	if (d.cb == cbG1 || d.cb == cbG2 || d.cb == cbG4) && d.targetWidth > 0 && d.targetWidth < width && d.interlace == itNone {
+		grayBuf = make([]byte, width)
+	}
+
 	// The +1 is for the per-row filter type, which is at cr[0].
 	rowSize := 1 + (int64(bitsPerPixel)*int64(width)+7)/8
 	if rowSize != int64(int(rowSize)) {
@@ -573,6 +579,17 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 		// Convert from bytes to colors.
 		switch d.cb {
 		case cbG1:
+			if d.targetWidth > 0 && d.targetWidth < width && d.interlace == itNone {
+				for x := 0; x < width; x += 8 {
+					b := cdat[x/8]
+					for x2 := 0; x2 < 8 && x+x2 < width; x2++ {
+						grayBuf[x+x2] = (b >> 7) * 0xff
+						b <<= 1
+					}
+				}
+				pixOffset = d.shrinkRowG8(grayBuf, nrgba, gray, pixOffset, width)
+				break
+			}
 			if d.useTransparent {
 				ty := d.transparent[1]
 				for x := 0; x < width; x += 8 {
@@ -597,6 +614,17 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 				}
 			}
 		case cbG2:
+			if d.targetWidth > 0 && d.targetWidth < width && d.interlace == itNone {
+				for x := 0; x < width; x += 4 {
+					b := cdat[x/4]
+					for x2 := 0; x2 < 4 && x+x2 < width; x2++ {
+						grayBuf[x+x2] = (b >> 6) * 0x55
+						b <<= 2
+					}
+				}
+				pixOffset = d.shrinkRowG8(grayBuf, nrgba, gray, pixOffset, width)
+				break
+			}
 			if d.useTransparent {
 				ty := d.transparent[1]
 				for x := 0; x < width; x += 4 {
@@ -621,6 +649,17 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 				}
 			}
 		case cbG4:
+			if d.targetWidth > 0 && d.targetWidth < width && d.interlace == itNone {
+				for x := 0; x < width; x += 2 {
+					b := cdat[x/2]
+					for x2 := 0; x2 < 2 && x+x2 < width; x2++ {
+						grayBuf[x+x2] = (b >> 4) * 0x11
+						b <<= 4
+					}
+				}
+				pixOffset = d.shrinkRowG8(grayBuf, nrgba, gray, pixOffset, width)
+				break
+			}
 			if d.useTransparent {
 				ty := d.transparent[1]
 				for x := 0; x < width; x += 2 {
