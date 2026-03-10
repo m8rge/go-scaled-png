@@ -457,6 +457,46 @@ func verticalRGBAColumnsQ15(pix []byte, stride, width, dstH int, ct *coeffTableQ
 	if ct == nil || dstH <= 0 {
 		return
 	}
+	// For narrow outputs the legacy loop tends to be as fast or faster.
+	if width <= 64 {
+		verticalRGBAColumnsQ15Narrow(pix, stride, width, dstH, ct)
+		return
+	}
+	buf := make([]byte, 4*dstH)
+	left := ct.left
+	off := ct.off
+	cnt := ct.cnt
+	wQ15 := ct.wQ15
+	for x := 0; x < width; x++ {
+		colOffset := 4 * x
+		for yd := 0; yd < dstH; yd++ {
+			rowIdx := int(left[yd])*stride + colOffset
+			wi := int(off[yd])
+			end := wi + int(cnt[yd])
+
+			var r, g, b, a int32
+			for wi < end {
+				q := int32(wQ15[wi])
+				r += int32(pix[rowIdx]) * q
+				g += int32(pix[rowIdx+1]) * q
+				b += int32(pix[rowIdx+2]) * q
+				a += int32(pix[rowIdx+3]) * q
+				rowIdx += stride
+				wi++
+			}
+			i := 4 * yd
+			buf[i+0] = clamp8((r + 16384) >> 15)
+			buf[i+1] = clamp8((g + 16384) >> 15)
+			buf[i+2] = clamp8((b + 16384) >> 15)
+			buf[i+3] = clamp8((a + 16384) >> 15)
+		}
+		for yd := 0; yd < dstH; yd++ {
+			copy(pix[yd*stride+colOffset:], buf[4*yd:4*yd+4])
+		}
+	}
+}
+
+func verticalRGBAColumnsQ15Narrow(pix []byte, stride, width, dstH int, ct *coeffTableQ15) {
 	buf := make([]byte, 4*dstH)
 	for x := 0; x < width; x++ {
 		colOffset := 4 * x
