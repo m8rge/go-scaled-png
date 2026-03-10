@@ -1,118 +1,117 @@
 package pngscaled
 
 import (
+	"bytes"
+	"fmt"
+	"image"
 	"image/png"
-	"os"
-	"runtime"
+	"sync"
 	"testing"
 
 	"github.com/kovidgoyal/imaging"
-	"github.com/stretchr/testify/require"
 )
 
-func TestShrink(t *testing.T) {
-	names := []string{"1.png", "2.png", "3.png", "i.png", "4.png"}
-	outNames := []string{"1-out.png", "2-out.png", "3-out.png", "i-out.png", "4-out.png"}
-
-	for i, name := range names {
-		data, err := os.Open(name)
-		require.NoError(t, err)
-		image, err := Decode(data, 120, 100, MitchellNetravali)
-		require.NoError(t, err)
-
-		file, err := os.Create(outNames[i])
-		require.NoError(t, err)
-		err = png.Encode(file, image)
-		require.NoError(t, err)
-	}
+type largeResizeCase struct {
+	name       string
+	srcW, srcH int
+	dstW, dstH int
 }
 
-func BenchmarkShrink(b *testing.B) {
-	runtime.GOMAXPROCS(1)
+var largeResizeCases = []largeResizeCase{
+	{name: "3456x2234_to_1920x1080", srcW: 3456, srcH: 2234, dstW: 1920, dstH: 1080},
+	{name: "3456x2234_to_32x32", srcW: 3456, srcH: 2234, dstW: 32, dstH: 32},
+}
 
-	names := []string{"1.png"}
-	files := make([]*os.File, len(names))
-	for i, name := range names {
-		data, err := os.Open(name)
-		require.NoError(b, err)
-		files[i] = data
+var (
+	largePNGCacheMu sync.Mutex
+	largePNGCache   = map[string][]byte{}
+)
+
+func benchmarkPNGData(tb testing.TB, w, h int) []byte {
+	tb.Helper()
+
+	key := fmt.Sprintf("%dx%d", w, h)
+	largePNGCacheMu.Lock()
+	data, ok := largePNGCache[key]
+	largePNGCacheMu.Unlock()
+	if ok {
+		return data
 	}
 
-	b.ReportAllocs()
-	for b.Loop() {
-		for _, file := range files {
-			file.Seek(0, 0)
+	img := image.NewNRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		row := img.Pix[y*img.Stride : y*img.Stride+w*4]
+		for x := 0; x < w; x++ {
+			i := x * 4
+			row[i+0] = uint8((x + y) & 0xff)
+			row[i+1] = uint8((x / 3) & 0xff)
+			row[i+2] = uint8((y / 5) & 0xff)
+			row[i+3] = 0xff
+		}
+	}
 
-			_, err := Decode(file, 120, 100, MitchellNetravali)
-			require.NoError(b, err)
+	var buf bytes.Buffer
+	enc := png.Encoder{CompressionLevel: png.BestSpeed}
+	if err := enc.Encode(&buf, img); err != nil {
+		tb.Fatalf("encode benchmark PNG %s: %v", key, err)
+	}
+	data = buf.Bytes()
+
+	largePNGCacheMu.Lock()
+	if cached, exists := largePNGCache[key]; exists {
+		data = cached
+	} else {
+		largePNGCache[key] = data
+	}
+	largePNGCacheMu.Unlock()
+
+	return data
+}
+
+func benchmarkResizeLargePNGScaled(b *testing.B, tc largeResizeCase) {
+	data := benchmarkPNGData(b, tc.srcW, tc.srcH)
+
+	b.SetBytes(int64(tc.srcW * tc.srcH * 4))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if _, err := Decode(bytes.NewReader(data), tc.dstW, tc.dstH, MitchellNetravali); err != nil {
+			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkShrinkInitial(b *testing.B) {
-	runtime.GOMAXPROCS(1)
+func benchmarkResizeLargeStdlibImaging(b *testing.B, tc largeResizeCase) {
+	data := benchmarkPNGData(b, tc.srcW, tc.srcH)
 
-	names := []string{"1.png"}
-	files := make([]*os.File, len(names))
-	for i, name := range names {
-		data, err := os.Open(name)
-		require.NoError(b, err)
-		files[i] = data
-	}
-
+	b.SetBytes(int64(tc.srcW * tc.srcH * 4))
 	b.ReportAllocs()
-	for b.Loop() {
-		for _, file := range files {
-			file.Seek(0, 0)
+	b.ResetTimer()
 
-			image, err := png.Decode(file)
-			require.NoError(b, err)
-			_ = imaging.Resize(image, 120, 100, imaging.MitchellNetravali)
+	for i := 0; i < b.N; i++ {
+		decoded, err := png.Decode(bytes.NewReader(data))
+		if err != nil {
+			b.Fatal(err)
 		}
+		_ = imaging.Resize(decoded, tc.dstW, tc.dstH, imaging.MitchellNetravali)
 	}
 }
 
-func BenchmarkShrink2(b *testing.B) {
-	runtime.GOMAXPROCS(1)
-
-	names := []string{"4.png"}
-	files := make([]*os.File, len(names))
-	for i, name := range names {
-		data, err := os.Open(name)
-		require.NoError(b, err)
-		files[i] = data
-	}
-
-	b.ReportAllocs()
-	for b.Loop() {
-		for _, file := range files {
-			file.Seek(0, 0)
-
-			_, err := Decode(file, 1920, 1062, MitchellNetravali)
-			require.NoError(b, err)
-		}
+func BenchmarkResizeLargePNGScaled(b *testing.B) {
+	for _, tc := range largeResizeCases {
+		tc := tc
+		b.Run(tc.name, func(b *testing.B) {
+			benchmarkResizeLargePNGScaled(b, tc)
+		})
 	}
 }
 
-func BenchmarkShrinkInitial2(b *testing.B) {
-	runtime.GOMAXPROCS(1)
-
-	names := []string{"4.png"}
-	files := make([]*os.File, len(names))
-	for i, name := range names {
-		data, err := os.Open(name)
-		require.NoError(b, err)
-		files[i] = data
-	}
-
-	b.ReportAllocs()
-	for b.Loop() {
-		for _, file := range files {
-			file.Seek(0, 0)
-
-			image, err := png.Decode(file)
-			require.NoError(b, err)
-			_ = imaging.Resize(image, 1920, 1062, imaging.MitchellNetravali)
-		}
+func BenchmarkResizeLargeStdlibImaging(b *testing.B) {
+	for _, tc := range largeResizeCases {
+		tc := tc
+		b.Run(tc.name, func(b *testing.B) {
+			benchmarkResizeLargeStdlibImaging(b, tc)
+		})
 	}
 }

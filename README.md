@@ -34,44 +34,14 @@ img, err := pngscaled.Decode(r, targetWidth, targetHeight, pngscaled.MitchellNet
 - `r` — any `io.Reader` over PNG data.
 - `targetWidth`, `targetHeight` — desired output dimensions. Pass `0` to
   skip resizing on that axis (the original dimension is preserved).
-- Filter — one of the filters listed below.
-
-The returned `image.Image` has the concrete type that matches the PNG color
-type:
-
-| PNG color type | Returned type |
-|---|---|
-| Gray 1/2/4/8-bit, no tRNS | `*image.Gray` |
-| Gray 16-bit, no tRNS | `*image.Gray16` |
-| Gray-Alpha 8-bit | `*image.NRGBA` |
-| Gray-Alpha 16-bit | `*image.NRGBA64` |
-| Gray + tRNS (any depth) | `*image.NRGBA` / `*image.NRGBA64` |
-| Truecolor 8-bit, no tRNS | `*image.RGBA` |
-| Truecolor 16-bit, no tRNS | `*image.RGBA64` |
-| Truecolor 8-bit + tRNS | `*image.NRGBA` |
-| Truecolor 16-bit + tRNS | `*image.NRGBA64` |
-| Truecolor-Alpha 8-bit | `*image.NRGBA` |
-| Truecolor-Alpha 16-bit | `*image.NRGBA64` |
-| Paletted (any depth) | `*image.NRGBA` (shrink path) / `*image.Paletted` (no resize) |
-| Interlaced | original type, not resized |
+- Filter — one of the supported kernels (see below).
 
 ## Filters
 
-| Filter | Notes |
-|---|---|
-| `MitchellNetravali` | Good default: smooth, minimal ringing |
-| `CatmullRom` | Sharper than Mitchell, similar to Lanczos |
-| `Lanczos` | Highest quality for photographic images |
-| `Linear` | Fast bilinear |
-| `Box` | Simple averaging, fastest |
-| `Gaussian`, `BSpline`, `Hermite`, `Bartlett`, `Hann`, `Hamming`, `Blackman`, `Welch`, `Cosine` | Specialist use |
-
-## Transparency (tRNS)
-
-PNG encodes transparency either as an alpha channel (color types GA, RGBA)
-or as a single transparent color value (tRNS chunk). Both cases are handled
-with premultiplied-alpha resampling to avoid dark halos at transparent
-boundaries. The output image stores straight (non-premultiplied) alpha.
+`MitchellNetravali` is the recommended default; `CatmullRom` and `Lanczos`
+are sharper; `Linear` and `Box` are faster; and `Gaussian`, `BSpline`,
+`Hermite`, `Bartlett`, `Hann`, `Hamming`, `Blackman`, `Welch`, and `Cosine`
+are available for specialized needs.
 
 ## Limitations
 
@@ -81,14 +51,33 @@ boundaries. The output image stores straight (non-premultiplied) alpha.
 - **Interlaced PNG images are not resized.** The full image is decoded and
   returned at its original size.
 
-## Visual inspection tool
+## Benchmarks
 
-```
-go run ./cmd/shrink-samples [-out dir] [-w N] [-h N] [files...]
+Benchmarks for a `3456x2234` source image (16" MBP screen resolution) are in
+`BenchmarkResizeLargePNGScaled` and `BenchmarkResizeLargeStdlibImaging`:
+
+```bash
+go test -run '^$' -bench 'BenchmarkResizeLarge(PNGScaled|StdlibImaging)' -benchmem -benchtime=1x ./...
 ```
 
-Decodes and scales PNG files, writing results to the output directory.
-Defaults to all `testdata/pngsuite/*.png` files at 16×16.
+These cover `3456x2234 -> 1920x1080` (Full HD) and `3456x2234 -> 32x32`.
+
+Reference run (`darwin/arm64`, Apple M2, `-benchtime=1x`):
+
+| Benchmark | CPU (ns/op) | Memory (B/op) |
+|---|---:|---:|
+| `BenchmarkResizeLargePNGScaled/3456x2234_to_1920x1080` | `137326959` | `17324864` |
+| `BenchmarkResizeLargePNGScaled/3456x2234_to_32x32` | `58325166` | `401088` |
+
+For baseline comparison (`png.Decode` + `imaging.Resize` on the same data):
+
+| Benchmark | CPU (ns/op) | Memory (B/op) |
+|---|---:|---:|
+| `BenchmarkResizeLargeStdlibImaging/3456x2234_to_1920x1080` | `58521250` | `57346112` |
+| `BenchmarkResizeLargeStdlibImaging/3456x2234_to_32x32` | `44936708` | `31836672` |
+
+The sample visual inspection tool is documented in
+`cmd/shrink-samples/README.md`.
 
 ## Testing
 
