@@ -259,6 +259,16 @@ func clamp8(v int32) byte {
 	return byte(v)
 }
 
+func clamp16(v int64) uint16 {
+	if v < 0 {
+		return 0
+	}
+	if v > 65535 {
+		return 65535
+	}
+	return uint16(v)
+}
+
 func getCoeffTableQ15(srcW, dstW int, f ResampleFilter) *coeffTableQ15 {
 	coeffCacheQ15Mu.Lock()
 	c := coeffCacheQ15
@@ -524,5 +534,307 @@ func VerticalGrayInPlaceQ15(img *image.Gray, dstH int, f ResampleFilter) {
 			img.Pix[yd*stride+x] = buf[yd]
 		}
 	}
+	img.Rect.Max.Y = img.Rect.Min.Y + dstH
+}
+
+// resampleGray16RowIntoQ15 resamples a Gray-16 source row (big-endian uint16, 2 bytes/pixel)
+// into a Gray16 pix destination (2 bytes/pixel).
+func resampleGray16RowIntoQ15(dst []byte, dstW int, src []byte, srcW int, f ResampleFilter) {
+	if dstW <= 0 || srcW <= 0 {
+		return
+	}
+	ct := getCoeffTableQ15(srcW, dstW, f)
+	const SHIFT = 15
+	const ROUND = 1 << (SHIFT - 1)
+	for x := 0; x < dstW; x++ {
+		left := int(ct.left[x])
+		off := int(ct.off[x])
+		n := int(ct.cnt[x])
+
+		var acc int64
+		si := left * 2
+		wi := off
+		for i := 0; i < n; i++ {
+			y := int64(uint16(src[si])<<8 | uint16(src[si+1]))
+			acc += y * int64(ct.wQ15[wi])
+			si += 2
+			wi++
+		}
+		v := clamp16((acc + ROUND) >> SHIFT)
+		di := x * 2
+		dst[di+0] = byte(v >> 8)
+		dst[di+1] = byte(v)
+	}
+}
+
+// resampleGray16ToNRGBA64IntoQ15 resamples a Gray-16 source row into NRGBA64 pix (8 bytes/pixel).
+// alpha is the constant alpha value (0xffff for opaque); caller does tRNS post-check.
+func resampleGray16ToNRGBA64IntoQ15(dst []byte, dstW int, src []byte, srcW int, f ResampleFilter, alpha uint16) {
+	if dstW <= 0 || srcW <= 0 {
+		return
+	}
+	ct := getCoeffTableQ15(srcW, dstW, f)
+	const SHIFT = 15
+	const ROUND = 1 << (SHIFT - 1)
+	for x := 0; x < dstW; x++ {
+		left := int(ct.left[x])
+		off := int(ct.off[x])
+		n := int(ct.cnt[x])
+
+		var acc int64
+		si := left * 2
+		wi := off
+		for i := 0; i < n; i++ {
+			y := int64(uint16(src[si])<<8 | uint16(src[si+1]))
+			acc += y * int64(ct.wQ15[wi])
+			si += 2
+			wi++
+		}
+		v := clamp16((acc + ROUND) >> SHIFT)
+		di := x * 8
+		dst[di+0] = byte(v >> 8)
+		dst[di+1] = byte(v)
+		dst[di+2] = byte(v >> 8)
+		dst[di+3] = byte(v)
+		dst[di+4] = byte(v >> 8)
+		dst[di+5] = byte(v)
+		dst[di+6] = byte(alpha >> 8)
+		dst[di+7] = byte(alpha)
+	}
+}
+
+// resampleGrayAlpha16PremulIntoNRGBA64Q15 resamples a GrayAlpha-16 source row into NRGBA64 pix.
+// Uses premultiplied-alpha accumulation.
+func resampleGrayAlpha16PremulIntoNRGBA64Q15(dst []byte, dstW int, src []byte, srcW int, f ResampleFilter) {
+	if dstW <= 0 || srcW <= 0 {
+		return
+	}
+	ct := getCoeffTableQ15(srcW, dstW, f)
+	for x := 0; x < dstW; x++ {
+		left := int(ct.left[x])
+		off := int(ct.off[x])
+		n := int(ct.cnt[x])
+
+		var aa, ag int64
+		si := left * 4 // 4 bytes per pixel: Y_hi Y_lo A_hi A_lo
+		wi := off
+		for i := 0; i < n; i++ {
+			w := int64(ct.wQ15[wi])
+			y := int64(uint16(src[si+0])<<8 | uint16(src[si+1]))
+			a := int64(uint16(src[si+2])<<8 | uint16(src[si+3]))
+			aa += a * w
+			ag += y * a * w
+			si += 4
+			wi++
+		}
+		var G, A int64
+		A = (aa + (1 << 14)) >> 15
+		if aa > 0 {
+			G = (ag + aa/2) / aa
+		}
+		gv := clamp16(G)
+		av := clamp16(A)
+		di := x * 8
+		dst[di+0] = byte(gv >> 8)
+		dst[di+1] = byte(gv)
+		dst[di+2] = byte(gv >> 8)
+		dst[di+3] = byte(gv)
+		dst[di+4] = byte(gv >> 8)
+		dst[di+5] = byte(gv)
+		dst[di+6] = byte(av >> 8)
+		dst[di+7] = byte(av)
+	}
+}
+
+// resampleRGB16toRGBA64BytesIntoQ15 resamples an RGB-16 source row into RGBA64/NRGBA64 pix (8 bytes/pixel).
+// alpha is the constant alpha value (0xffff for opaque); caller does tRNS post-check.
+func resampleRGB16toRGBA64BytesIntoQ15(dst []byte, dstW int, src []byte, srcW int, f ResampleFilter, alpha uint16) {
+	if dstW <= 0 || srcW <= 0 {
+		return
+	}
+	ct := getCoeffTableQ15(srcW, dstW, f)
+	const SHIFT = 15
+	const ROUND = 1 << (SHIFT - 1)
+	for x := 0; x < dstW; x++ {
+		left := int(ct.left[x])
+		off := int(ct.off[x])
+		n := int(ct.cnt[x])
+
+		var r, g, b int64
+		si := left * 6 // 6 bytes per pixel: R_hi R_lo G_hi G_lo B_hi B_lo
+		wi := off
+		for i := 0; i < n; i++ {
+			w := int64(ct.wQ15[wi])
+			r += int64(uint16(src[si+0])<<8|uint16(src[si+1])) * w
+			g += int64(uint16(src[si+2])<<8|uint16(src[si+3])) * w
+			b += int64(uint16(src[si+4])<<8|uint16(src[si+5])) * w
+			si += 6
+			wi++
+		}
+		rv := clamp16((r + ROUND) >> SHIFT)
+		gv := clamp16((g + ROUND) >> SHIFT)
+		bv := clamp16((b + ROUND) >> SHIFT)
+		di := x * 8
+		dst[di+0] = byte(rv >> 8)
+		dst[di+1] = byte(rv)
+		dst[di+2] = byte(gv >> 8)
+		dst[di+3] = byte(gv)
+		dst[di+4] = byte(bv >> 8)
+		dst[di+5] = byte(bv)
+		dst[di+6] = byte(alpha >> 8)
+		dst[di+7] = byte(alpha)
+	}
+}
+
+// resampleRGBA16PremulIntoNRGBA64Q15 resamples an RGBA-16 source row into NRGBA64 pix.
+// Uses premultiplied-alpha accumulation.
+func resampleRGBA16PremulIntoNRGBA64Q15(dst []byte, dstW int, src []byte, srcW int, f ResampleFilter) {
+	if dstW <= 0 || srcW <= 0 {
+		return
+	}
+	ct := getCoeffTableQ15(srcW, dstW, f)
+	for x := 0; x < dstW; x++ {
+		left := int(ct.left[x])
+		off := int(ct.off[x])
+		n := int(ct.cnt[x])
+
+		var ar, ag, ab, aa int64
+		si := left * 8 // 8 bytes per pixel: R_hi R_lo G_hi G_lo B_hi B_lo A_hi A_lo
+		wi := off
+		for i := 0; i < n; i++ {
+			w := int64(ct.wQ15[wi])
+			a := int64(uint16(src[si+6])<<8 | uint16(src[si+7]))
+			aa += a * w
+			aw := a * w
+			ar += int64(uint16(src[si+0])<<8|uint16(src[si+1])) * aw
+			ag += int64(uint16(src[si+2])<<8|uint16(src[si+3])) * aw
+			ab += int64(uint16(src[si+4])<<8|uint16(src[si+5])) * aw
+			si += 8
+			wi++
+		}
+		var R, G, B, A int64
+		A = (aa + (1 << 14)) >> 15
+		if aa > 0 {
+			R = (ar + aa/2) / aa
+			G = (ag + aa/2) / aa
+			B = (ab + aa/2) / aa
+		}
+		rv := clamp16(R)
+		gv := clamp16(G)
+		bv := clamp16(B)
+		av := clamp16(A)
+		di := x * 8
+		dst[di+0] = byte(rv >> 8)
+		dst[di+1] = byte(rv)
+		dst[di+2] = byte(gv >> 8)
+		dst[di+3] = byte(gv)
+		dst[di+4] = byte(bv >> 8)
+		dst[di+5] = byte(bv)
+		dst[di+6] = byte(av >> 8)
+		dst[di+7] = byte(av)
+	}
+}
+
+// verticalNRGBA64ColumnsQ15 performs vertical resampling on NRGBA64/RGBA64 pix in-place.
+// Layout: 8 bytes/pixel, 4 channels, big-endian uint16.
+func verticalNRGBA64ColumnsQ15(pix []byte, stride, width, dstH int, ct *coeffTableQ15) {
+	if ct == nil || dstH <= 0 {
+		return
+	}
+	buf := make([]byte, 8*dstH)
+	for x := 0; x < width; x++ {
+		colOffset := 8 * x
+		for yd := 0; yd < dstH; yd++ {
+			start := int(ct.left[yd])
+			n := int(ct.cnt[yd])
+			wi := int(ct.off[yd])
+
+			var r, g, b, a int64
+			for k := 0; k < n; k++ {
+				q := int64(ct.wQ15[wi+k])
+				p := pix[(start+k)*stride+colOffset:]
+				r += int64(uint16(p[0])<<8|uint16(p[1])) * q
+				g += int64(uint16(p[2])<<8|uint16(p[3])) * q
+				b += int64(uint16(p[4])<<8|uint16(p[5])) * q
+				a += int64(uint16(p[6])<<8|uint16(p[7])) * q
+			}
+			rv := clamp16((r + 16384) >> 15)
+			gv := clamp16((g + 16384) >> 15)
+			bv := clamp16((b + 16384) >> 15)
+			av := clamp16((a + 16384) >> 15)
+			i := 8 * yd
+			buf[i+0] = byte(rv >> 8)
+			buf[i+1] = byte(rv)
+			buf[i+2] = byte(gv >> 8)
+			buf[i+3] = byte(gv)
+			buf[i+4] = byte(bv >> 8)
+			buf[i+5] = byte(bv)
+			buf[i+6] = byte(av >> 8)
+			buf[i+7] = byte(av)
+		}
+		for yd := 0; yd < dstH; yd++ {
+			copy(pix[yd*stride+colOffset:], buf[8*yd:8*yd+8])
+		}
+	}
+}
+
+// verticalGray16ColumnsQ15 performs vertical resampling on Gray16 pix in-place.
+// Layout: 2 bytes/pixel, big-endian uint16.
+func verticalGray16ColumnsQ15(pix []byte, stride, width, dstH int, ct *coeffTableQ15) {
+	if ct == nil || dstH <= 0 {
+		return
+	}
+	buf := make([]byte, 2*dstH)
+	for x := 0; x < width; x++ {
+		colOffset := 2 * x
+		for yd := 0; yd < dstH; yd++ {
+			start := int(ct.left[yd])
+			n := int(ct.cnt[yd])
+			wi := int(ct.off[yd])
+
+			var acc int64
+			for k := 0; k < n; k++ {
+				q := int64(ct.wQ15[wi+k])
+				p := pix[(start+k)*stride+colOffset:]
+				acc += int64(uint16(p[0])<<8|uint16(p[1])) * q
+			}
+			v := clamp16((acc + 16384) >> 15)
+			i := 2 * yd
+			buf[i+0] = byte(v >> 8)
+			buf[i+1] = byte(v)
+		}
+		for yd := 0; yd < dstH; yd++ {
+			copy(pix[yd*stride+colOffset:], buf[2*yd:2*yd+2])
+		}
+	}
+}
+
+func VerticalNRGBA64InPlaceQ15(img *image.NRGBA64, dstH int, f ResampleFilter) {
+	if img == nil || dstH <= 0 || dstH >= img.Rect.Dy() {
+		return
+	}
+	srcH, w, stride := img.Rect.Dy(), img.Rect.Dx(), img.Stride
+	ct := getCoeffTableQ15Y(srcH, dstH, f)
+	verticalNRGBA64ColumnsQ15(img.Pix, stride, w, dstH, ct)
+	img.Rect.Max.Y = img.Rect.Min.Y + dstH
+}
+
+func VerticalRGBA64InPlaceQ15(img *image.RGBA64, dstH int, f ResampleFilter) {
+	if img == nil || dstH <= 0 || dstH >= img.Rect.Dy() {
+		return
+	}
+	srcH, w, stride := img.Rect.Dy(), img.Rect.Dx(), img.Stride
+	ct := getCoeffTableQ15Y(srcH, dstH, f)
+	verticalNRGBA64ColumnsQ15(img.Pix, stride, w, dstH, ct)
+	img.Rect.Max.Y = img.Rect.Min.Y + dstH
+}
+
+func VerticalGray16InPlaceQ15(img *image.Gray16, dstH int, f ResampleFilter) {
+	if img == nil || dstH <= 0 || dstH >= img.Rect.Dy() {
+		return
+	}
+	srcH, w, stride := img.Rect.Dy(), img.Rect.Dx(), img.Stride
+	ct := getCoeffTableQ15Y(srcH, dstH, f)
+	verticalGray16ColumnsQ15(img.Pix, stride, w, dstH, ct)
 	img.Rect.Max.Y = img.Rect.Min.Y + dstH
 }

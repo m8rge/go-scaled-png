@@ -472,8 +472,13 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 		}
 	case cbP1, cbP2, cbP4, cbP8:
 		bitsPerPixel = d.depth
-		paletted = image.NewPaletted(image.Rect(0, 0, width, height), d.palette)
-		img = paletted
+		if d.targetWidth > 0 && d.targetWidth < width && d.interlace == itNone {
+			nrgba = image.NewNRGBA(rect)
+			img = nrgba
+		} else {
+			paletted = image.NewPaletted(image.Rect(0, 0, width, height), d.palette)
+			img = paletted
+		}
 	case cbTCA8:
 		bitsPerPixel = 32
 		nrgba = image.NewNRGBA(rect)
@@ -481,34 +486,40 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 	case cbG16:
 		bitsPerPixel = 16
 		if d.useTransparent {
-			nrgba64 = image.NewNRGBA64(image.Rect(0, 0, width, height))
+			nrgba64 = image.NewNRGBA64(rect)
 			img = nrgba64
 		} else {
-			gray16 = image.NewGray16(image.Rect(0, 0, width, height))
+			gray16 = image.NewGray16(rect)
 			img = gray16
 		}
 	case cbGA16:
 		bitsPerPixel = 32
-		nrgba64 = image.NewNRGBA64(image.Rect(0, 0, width, height))
+		nrgba64 = image.NewNRGBA64(rect)
 		img = nrgba64
 	case cbTC16:
 		bitsPerPixel = 48
 		if d.useTransparent {
-			nrgba64 = image.NewNRGBA64(image.Rect(0, 0, width, height))
+			nrgba64 = image.NewNRGBA64(rect)
 			img = nrgba64
 		} else {
-			rgba64 = image.NewRGBA64(image.Rect(0, 0, width, height))
+			rgba64 = image.NewRGBA64(rect)
 			img = rgba64
 		}
 	case cbTCA16:
 		bitsPerPixel = 64
-		nrgba64 = image.NewNRGBA64(image.Rect(0, 0, width, height))
+		nrgba64 = image.NewNRGBA64(rect)
 		img = nrgba64
 	}
 	if allocateOnly {
 		return img, nil
 	}
 	bytesPerPixel := (bitsPerPixel + 7) / 8
+
+	// scratch buffer for paletted shrink: expand palette indices to RGBA before resampling
+	var rowBuf []byte
+	if cbPaletted(d.cb) && d.targetWidth > 0 && d.targetWidth < width && d.interlace == itNone {
+		rowBuf = make([]byte, width*4)
+	}
 
 	// The +1 is for the per-row filter type, which is at cr[0].
 	rowSize := 1 + (int64(bitsPerPixel)*int64(width)+7)/8
@@ -703,52 +714,59 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 				}
 				pixOffset += rgba.Stride
 			}
-		case cbP1:
-			for x := 0; x < width; x += 8 {
-				b := cdat[x/8]
-				for x2 := 0; x2 < 8 && x+x2 < width; x2++ {
-					idx := b >> 7
-					if len(paletted.Palette) <= int(idx) {
-						paletted.Palette = paletted.Palette[:int(idx)+1]
-					}
-					paletted.SetColorIndex(x+x2, y, idx)
-					b <<= 1
-				}
+		case cbP1, cbP2, cbP4, cbP8:
+			if d.targetWidth > 0 && d.targetWidth < width && d.interlace == itNone {
+				pixOffset = d.shrinkRowP(cdat, d.depth, d.palette, rowBuf, nrgba, pixOffset, width)
+				break
 			}
-		case cbP2:
-			for x := 0; x < width; x += 4 {
-				b := cdat[x/4]
-				for x2 := 0; x2 < 4 && x+x2 < width; x2++ {
-					idx := b >> 6
-					if len(paletted.Palette) <= int(idx) {
-						paletted.Palette = paletted.Palette[:int(idx)+1]
-					}
-					paletted.SetColorIndex(x+x2, y, idx)
-					b <<= 2
-				}
-			}
-		case cbP4:
-			for x := 0; x < width; x += 2 {
-				b := cdat[x/2]
-				for x2 := 0; x2 < 2 && x+x2 < width; x2++ {
-					idx := b >> 4
-					if len(paletted.Palette) <= int(idx) {
-						paletted.Palette = paletted.Palette[:int(idx)+1]
-					}
-					paletted.SetColorIndex(x+x2, y, idx)
-					b <<= 4
-				}
-			}
-		case cbP8:
-			if len(paletted.Palette) != 256 {
-				for x := 0; x < width; x++ {
-					if len(paletted.Palette) <= int(cdat[x]) {
-						paletted.Palette = paletted.Palette[:int(cdat[x])+1]
+			switch d.depth {
+			case 1:
+				for x := 0; x < width; x += 8 {
+					b := cdat[x/8]
+					for x2 := 0; x2 < 8 && x+x2 < width; x2++ {
+						idx := b >> 7
+						if len(paletted.Palette) <= int(idx) {
+							paletted.Palette = paletted.Palette[:int(idx)+1]
+						}
+						paletted.SetColorIndex(x+x2, y, idx)
+						b <<= 1
 					}
 				}
+			case 2:
+				for x := 0; x < width; x += 4 {
+					b := cdat[x/4]
+					for x2 := 0; x2 < 4 && x+x2 < width; x2++ {
+						idx := b >> 6
+						if len(paletted.Palette) <= int(idx) {
+							paletted.Palette = paletted.Palette[:int(idx)+1]
+						}
+						paletted.SetColorIndex(x+x2, y, idx)
+						b <<= 2
+					}
+				}
+			case 4:
+				for x := 0; x < width; x += 2 {
+					b := cdat[x/2]
+					for x2 := 0; x2 < 2 && x+x2 < width; x2++ {
+						idx := b >> 4
+						if len(paletted.Palette) <= int(idx) {
+							paletted.Palette = paletted.Palette[:int(idx)+1]
+						}
+						paletted.SetColorIndex(x+x2, y, idx)
+						b <<= 4
+					}
+				}
+			case 8:
+				if len(paletted.Palette) != 256 {
+					for x := 0; x < width; x++ {
+						if len(paletted.Palette) <= int(cdat[x]) {
+							paletted.Palette = paletted.Palette[:int(cdat[x])+1]
+						}
+					}
+				}
+				copy(paletted.Pix[pixOffset:], cdat)
+				pixOffset += paletted.Stride
 			}
-			copy(paletted.Pix[pixOffset:], cdat)
-			pixOffset += paletted.Stride
 		case cbTCA8:
 			if d.targetWidth > 0 && d.targetWidth < width && d.interlace == itNone {
 				pixOffset = d.shrinkRowTCA8(cdat, nrgba, pixOffset, width)
@@ -759,6 +777,10 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 			copy(nrgba.Pix[pixOffset:], cdat)
 			pixOffset += nrgba.Stride
 		case cbG16:
+			if d.targetWidth > 0 && d.targetWidth < width && d.interlace == itNone {
+				pixOffset = d.shrinkRowG16(cdat, nrgba64, gray16, pixOffset, width)
+				break
+			}
 			if d.useTransparent {
 				ty := uint16(d.transparent[0])<<8 | uint16(d.transparent[1])
 				for x := 0; x < width; x++ {
@@ -776,12 +798,20 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 				}
 			}
 		case cbGA16:
+			if d.targetWidth > 0 && d.targetWidth < width && d.interlace == itNone {
+				pixOffset = d.shrinkRowGA16(cdat, nrgba64, pixOffset, width)
+				break
+			}
 			for x := 0; x < width; x++ {
 				ycol := uint16(cdat[4*x+0])<<8 | uint16(cdat[4*x+1])
 				acol := uint16(cdat[4*x+2])<<8 | uint16(cdat[4*x+3])
 				nrgba64.SetNRGBA64(x, y, color.NRGBA64{ycol, ycol, ycol, acol})
 			}
 		case cbTC16:
+			if d.targetWidth > 0 && d.targetWidth < width && d.interlace == itNone {
+				pixOffset = d.shrinkRowTC16(cdat, nrgba64, rgba64, pixOffset, width)
+				break
+			}
 			if d.useTransparent {
 				tr := uint16(d.transparent[0])<<8 | uint16(d.transparent[1])
 				tg := uint16(d.transparent[2])<<8 | uint16(d.transparent[3])
@@ -805,6 +835,10 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 				}
 			}
 		case cbTCA16:
+			if d.targetWidth > 0 && d.targetWidth < width && d.interlace == itNone {
+				pixOffset = d.shrinkRowTCA16(cdat, nrgba64, pixOffset, width)
+				break
+			}
 			for x := 0; x < width; x++ {
 				rcol := uint16(cdat[8*x+0])<<8 | uint16(cdat[8*x+1])
 				gcol := uint16(cdat[8*x+2])<<8 | uint16(cdat[8*x+3])
@@ -826,6 +860,12 @@ func (d *decoder) readImagePass(r io.Reader, pass int, allocateOnly bool) (image
 			VerticalNRGBAInPlaceQ15(im, d.targetHeight, d.filter)
 		case *image.Gray:
 			VerticalGrayInPlaceQ15(im, d.targetHeight, d.filter)
+		case *image.NRGBA64:
+			VerticalNRGBA64InPlaceQ15(im, d.targetHeight, d.filter)
+		case *image.RGBA64:
+			VerticalRGBA64InPlaceQ15(im, d.targetHeight, d.filter)
+		case *image.Gray16:
+			VerticalGray16InPlaceQ15(im, d.targetHeight, d.filter)
 		}
 	}
 
