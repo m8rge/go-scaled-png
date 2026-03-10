@@ -21,17 +21,25 @@ func TestShrinkPNGSuiteTypes(t *testing.T) {
 		file     string
 		wantType string // expected fmt.Sprintf("%T", img)
 	}{
-		{"basn0g16", "*image.Gray16"},    // cbG16, no tRNS  → Gray16
-		{"ftbwn0g16", "*image.NRGBA64"}, // cbG16 + tRNS    → NRGBA64
-		{"basn4a16", "*image.NRGBA64"},  // cbGA16           → NRGBA64
-		{"basn2c16", "*image.RGBA64"},   // cbTC16, no tRNS  → RGBA64
-		{"ftbbn2c16", "*image.NRGBA64"}, // cbTC16 + tRNS    → NRGBA64
-		{"basn6a16", "*image.NRGBA64"},  // cbTCA16          → NRGBA64
-		{"basn3p01", "*image.NRGBA"},    // cbP1             → NRGBA (shrink path)
-		{"basn3p02", "*image.NRGBA"},    // cbP2             → NRGBA
-		{"basn3p04", "*image.NRGBA"},    // cbP4             → NRGBA
-		{"basn3p08", "*image.NRGBA"},    // cbP8             → NRGBA
-		{"basn3p08-trns", "*image.NRGBA"}, // cbP8 + tRNS   → NRGBA
+		// 8-bit types
+		{"basn0g08", "*image.Gray"},   // cbG8, no tRNS   → Gray
+		{"basn4a08", "*image.NRGBA"},  // cbGA8            → NRGBA
+		{"basn2c08", "*image.RGBA"},   // cbTC8, no tRNS  → RGBA
+		{"ftbrn2c08", "*image.NRGBA"}, // cbTC8 + tRNS    → NRGBA
+		{"basn6a08", "*image.NRGBA"},  // cbTCA8           → NRGBA
+		// 16-bit types
+		{"basn0g16", "*image.Gray16"},     // cbG16, no tRNS  → Gray16
+		{"ftbwn0g16", "*image.NRGBA64"},   // cbG16 + tRNS    → NRGBA64
+		{"basn4a16", "*image.NRGBA64"},    // cbGA16           → NRGBA64
+		{"basn2c16", "*image.RGBA64"},     // cbTC16, no tRNS  → RGBA64
+		{"ftbbn2c16", "*image.NRGBA64"},   // cbTC16 + tRNS    → NRGBA64
+		{"basn6a16", "*image.NRGBA64"},    // cbTCA16          → NRGBA64
+		// paletted types
+		{"basn3p01", "*image.NRGBA"},      // cbP1             → NRGBA (shrink path)
+		{"basn3p02", "*image.NRGBA"},      // cbP2             → NRGBA
+		{"basn3p04", "*image.NRGBA"},      // cbP4             → NRGBA
+		{"basn3p08", "*image.NRGBA"},      // cbP8             → NRGBA
+		{"basn3p08-trns", "*image.NRGBA"}, // cbP8 + tRNS      → NRGBA
 	}
 	for _, tc := range cases {
 		t.Run(tc.file, func(t *testing.T) {
@@ -126,6 +134,70 @@ func TestShrinkFlatColor(t *testing.T) {
 		}
 	})
 
+	t.Run("Gray8", func(t *testing.T) {
+		const wantY = uint8(0x7e)
+		src := image.NewGray(image.Rect(0, 0, srcW, srcH))
+		for y := 0; y < srcH; y++ {
+			for x := 0; x < srcW; x++ {
+				src.SetGray(x, y, color.Gray{Y: wantY})
+			}
+		}
+		img := mustShrink(t, src, dstW, dstH)
+		gray := img.(*image.Gray)
+		for y := 0; y < dstH; y++ {
+			for x := 0; x < dstW; x++ {
+				got := gray.GrayAt(x, y).Y
+				if absDiffU8(got, wantY) > 1 {
+					t.Fatalf("at (%d,%d): got %d, want %d", x, y, got, wantY)
+				}
+			}
+		}
+	})
+
+	t.Run("NRGBA_GA8_semitransparent", func(t *testing.T) {
+		// image.NewNRGBA with A < 0xff encodes as cbGA8.
+		want := color.NRGBA{R: 120, G: 120, B: 120, A: 180}
+		src := image.NewNRGBA(image.Rect(0, 0, srcW, srcH))
+		for y := 0; y < srcH; y++ {
+			for x := 0; x < srcW; x++ {
+				src.SetNRGBA(x, y, want)
+			}
+		}
+		img := mustShrink(t, src, dstW, dstH)
+		nrgba := img.(*image.NRGBA)
+		for y := 0; y < dstH; y++ {
+			for x := 0; x < dstW; x++ {
+				got := nrgba.NRGBAAt(x, y)
+				if absDiffU8(got.R, want.R) > 1 || absDiffU8(got.G, want.G) > 1 ||
+					absDiffU8(got.B, want.B) > 1 || absDiffU8(got.A, want.A) > 1 {
+					t.Fatalf("at (%d,%d): got %v, want approx %v", x, y, got, want)
+				}
+			}
+		}
+	})
+
+	t.Run("RGBA_TC8_fullalpha", func(t *testing.T) {
+		// image.NewNRGBA with all A=0xff encodes as cbTC8 → returns *image.RGBA.
+		want := color.NRGBA{R: 200, G: 80, B: 40, A: 0xff}
+		src := image.NewNRGBA(image.Rect(0, 0, srcW, srcH))
+		for y := 0; y < srcH; y++ {
+			for x := 0; x < srcW; x++ {
+				src.SetNRGBA(x, y, want)
+			}
+		}
+		img := mustShrink(t, src, dstW, dstH)
+		rgba := img.(*image.RGBA)
+		for y := 0; y < dstH; y++ {
+			for x := 0; x < dstW; x++ {
+				got := rgba.RGBAAt(x, y)
+				if absDiffU8(got.R, want.R) > 1 || absDiffU8(got.G, want.G) > 1 ||
+					absDiffU8(got.B, want.B) > 1 || got.A != 0xff {
+					t.Fatalf("at (%d,%d): got %v, want approx %v", x, y, got, want)
+				}
+			}
+		}
+	})
+
 	t.Run("PalettedP8", func(t *testing.T) {
 		pal := color.Palette{
 			color.RGBA{R: 200, G: 100, B: 50, A: 255},
@@ -173,6 +245,31 @@ func TestShrinkFlatColor(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestShrinkGray8Transparent verifies the cbG8+tRNS shrink path (resampleGrayToRGBAIntoQ15).
+// The binary is the same 15×11 gray+tRNS PNG used in TestGray8Transparent.
+func TestShrinkGray8Transparent(t *testing.T) {
+	data := []byte{
+		0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+		0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x00, 0x0b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x85, 0x2c, 0x88,
+		0x80, 0x00, 0x00, 0x00, 0x02, 0x74, 0x52, 0x4e, 0x53, 0x00, 0xff, 0x5b, 0x91, 0x22, 0xb5, 0x00,
+		0x00, 0x00, 0x02, 0x62, 0x4b, 0x47, 0x44, 0x00, 0xff, 0x87, 0x8f, 0xcc, 0xbf, 0x00, 0x00, 0x00,
+		0x09, 0x70, 0x48, 0x59, 0x73, 0x00, 0x00, 0x0a, 0xf0, 0x00, 0x00, 0x0a, 0xf0, 0x01, 0x42, 0xac,
+		0x34, 0x98, 0x00, 0x00, 0x00, 0x07, 0x74, 0x49, 0x4d, 0x45, 0x07, 0xd5, 0x04, 0x02, 0x12, 0x11,
+		0x11, 0xf7, 0x65, 0x3d, 0x8b, 0x00, 0x00, 0x00, 0x4f, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63,
+		0xf8, 0xff, 0xff, 0xff, 0xb9, 0xbd, 0x70, 0xf0, 0x8c, 0x01, 0xc8, 0xaf, 0x6e, 0x99, 0x02, 0x05,
+		0xd9, 0x7b, 0xc1, 0xfc, 0x6b, 0xff, 0xa1, 0xa0, 0x87, 0x30, 0xff, 0xd9, 0xde, 0xbd, 0xd5, 0x4b,
+		0xf7, 0xee, 0xfd, 0x0e, 0xe3, 0xef, 0xcd, 0x06, 0x19, 0x14, 0xf5, 0x1e, 0xce, 0xef, 0x01, 0x31,
+		0x92, 0xd7, 0x82, 0x41, 0x31, 0x9c, 0x3f, 0x07, 0x02, 0xee, 0xa1, 0xaa, 0xff, 0xff, 0x9f, 0xe1,
+		0xd9, 0x56, 0x30, 0xf8, 0x0e, 0xe5, 0x03, 0x00, 0xa9, 0x42, 0x84, 0x3d, 0xdf, 0x8f, 0xa6, 0x8f,
+		0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+	}
+	// Source is 15×11; shrink to 8×6.
+	img, err := Decode(bytes.NewReader(data), 8, 6, MitchellNetravali)
+	require.NoError(t, err)
+	require.Equal(t, image.Rect(0, 0, 8, 6), img.Bounds())
+	require.Equal(t, "*image.NRGBA", fmt.Sprintf("%T", img), "cbG8+tRNS must return NRGBA")
 }
 
 // TestShrinkOnlyHorizontal and TestShrinkOnlyVertical test partial scaling
