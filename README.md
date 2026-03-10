@@ -64,17 +64,17 @@ These cover `3456x2234 -> 1920x1080` (Full HD) and `3456x2234 -> 32x32`.
 
 Reference run (`darwin/arm64`, Apple M2, averages over `-count=5`):
 
-| Benchmark | CPU (ns/op) | Memory (B/op) |
-|---|---:|---:|
-| `BenchmarkResizeLargePNGScaled/3456x2234_to_1920x1080` | `75141693` | `17271989` |
-| `BenchmarkResizeLargePNGScaled/3456x2234_to_32x32` | `54016277` | `354519` |
+| Benchmark | CPU (ns/op) | Memory (B/op) | Allocs (allocs/op) |
+|---|---:|---:|---:|
+| `BenchmarkResizeLargePNGScaled/3456x2234_to_1920x1080` | `74423030` | `17274031` | `35.8` |
+| `BenchmarkResizeLargePNGScaled/3456x2234_to_32x32` | `55202217` | `354517` | `16.0` |
 
 For baseline comparison (`png.Decode` + `imaging.Resize` on the same data):
 
-| Benchmark | CPU (ns/op) | Memory (B/op) |
-|---|---:|---:|
-| `BenchmarkResizeLargeStdlibImaging/3456x2234_to_1920x1080` | `61325341` | `57329316` |
-| `BenchmarkResizeLargeStdlibImaging/3456x2234_to_32x32` | `45143010` | `31831211` |
+| Benchmark | CPU (ns/op) | Memory (B/op) | Allocs (allocs/op) |
+|---|---:|---:|---:|
+| `BenchmarkResizeLargeStdlibImaging/3456x2234_to_1920x1080` | `58284645` | `57329325` | `63.0` |
+| `BenchmarkResizeLargeStdlibImaging/3456x2234_to_32x32` | `45089980` | `31831211` | `63.0` |
 
 The sample visual inspection tool is documented in
 `cmd/shrink-samples/README.md`.

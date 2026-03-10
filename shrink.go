@@ -469,24 +469,36 @@ func verticalRGBAColumnsQ15(pix []byte, stride, width, dstH int, ct *coeffTableQ
 	}
 	// Keep tiny images single-threaded to avoid scheduling overhead.
 	if workers <= 1 || width < workers*2 {
-		verticalRGBAColumnsQ15Range(pix, stride, dstH, ct, 0, width)
+		buf := make([]byte, 4*dstH)
+		verticalRGBAColumnsQ15Range(pix, stride, dstH, ct, 0, width, buf)
 		return
 	}
+	bufStride := 4 * dstH
+	bufs := make([]byte, workers*bufStride)
 	var wg sync.WaitGroup
-	wg.Add(workers)
-	for w := 0; w < workers; w++ {
+	wg.Add(workers - 1)
+	for w := 1; w < workers; w++ {
 		xStart := w * width / workers
 		xEnd := (w + 1) * width / workers
+		wbuf := bufs[w*bufStride : (w+1)*bufStride]
 		go func(start, end int) {
 			defer wg.Done()
-			verticalRGBAColumnsQ15Range(pix, stride, dstH, ct, start, end)
+			verticalRGBAColumnsQ15Range(pix, stride, dstH, ct, start, end, wbuf)
 		}(xStart, xEnd)
 	}
+	verticalRGBAColumnsQ15Range(
+		pix,
+		stride,
+		dstH,
+		ct,
+		0,
+		width/workers,
+		bufs[:bufStride],
+	)
 	wg.Wait()
 }
 
-func verticalRGBAColumnsQ15Range(pix []byte, stride, dstH int, ct *coeffTableQ15, xStart, xEnd int) {
-	buf := make([]byte, 4*dstH)
+func verticalRGBAColumnsQ15Range(pix []byte, stride, dstH int, ct *coeffTableQ15, xStart, xEnd int, buf []byte) {
 	left := ct.left
 	off := ct.off
 	cnt := ct.cnt
