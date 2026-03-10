@@ -2,6 +2,7 @@ package pngscaled
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"image"
 	"image/color"
@@ -12,34 +13,61 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestShrinkPNGSuiteTypes verifies that shrinking works for all new color types
-// (16-bit and paletted) without panics, and returns the correct Go image type.
+var update = flag.Bool("update", false, "regenerate golden files in testdata/golden/")
+
+// TestShrinkPNGSuiteTypes verifies that shrinking works for all PNG test suite
+// files without panics, and returns the correct Go image type and bounds.
 // Files are from the public-domain PNG test suite shipped in testdata/pngsuite/.
 func TestShrinkPNGSuiteTypes(t *testing.T) {
-	// All basn/ft files below are 32×32; we shrink to 16×16.
+	dstRect := image.Rect(0, 0, 16, 16) // expected bounds for all resizable files
 	cases := []struct {
-		file     string
-		wantType string // expected fmt.Sprintf("%T", img)
+		file      string
+		wantType  string      // expected fmt.Sprintf("%T", img)
+		wantBounds image.Rectangle // zero value → use dstRect
 	}{
+		// sub-byte gray, no tRNS
+		{"basn0g01", "*image.Gray", image.Rectangle{}},  // cbG1, 32×32 → Gray
+		{"basn0g02", "*image.Gray", image.Rectangle{}},  // cbG2, 32×32 → Gray
+		{"basn0g04", "*image.Gray", image.Rectangle{}},  // cbG4, 32×32 → Gray
+		// sub-byte gray with non-standard widths (29/30/31 pixels)
+		{"basn0g01-30", "*image.Gray", image.Rectangle{}}, // cbG1, 30×30 → Gray
+		{"basn0g02-29", "*image.Gray", image.Rectangle{}}, // cbG2, 29×29 → Gray
+		{"basn0g04-31", "*image.Gray", image.Rectangle{}}, // cbG4, 31×31 → Gray
+		// sub-byte gray + tRNS
+		{"ftbbn0g01", "*image.NRGBA", image.Rectangle{}}, // cbG1 + tRNS → NRGBA
+		{"ftbbn0g02", "*image.NRGBA", image.Rectangle{}}, // cbG2 + tRNS → NRGBA
+		{"ftbbn0g04", "*image.NRGBA", image.Rectangle{}}, // cbG4 + tRNS → NRGBA
 		// 8-bit types
-		{"basn0g08", "*image.Gray"},   // cbG8, no tRNS   → Gray
-		{"basn4a08", "*image.NRGBA"},  // cbGA8            → NRGBA
-		{"basn2c08", "*image.RGBA"},   // cbTC8, no tRNS  → RGBA
-		{"ftbrn2c08", "*image.NRGBA"}, // cbTC8 + tRNS    → NRGBA
-		{"basn6a08", "*image.NRGBA"},  // cbTCA8           → NRGBA
+		{"basn0g08", "*image.Gray", image.Rectangle{}},   // cbG8, no tRNS → Gray
+		{"basn4a08", "*image.NRGBA", image.Rectangle{}},  // cbGA8          → NRGBA
+		{"basn2c08", "*image.RGBA", image.Rectangle{}},   // cbTC8, no tRNS → RGBA
+		{"ftbrn2c08", "*image.NRGBA", image.Rectangle{}}, // cbTC8 + tRNS   → NRGBA
+		{"basn6a08", "*image.NRGBA", image.Rectangle{}},  // cbTCA8         → NRGBA
+		// PNG filter type tests (same color types, different filter encoding)
+		{"ftp0n0g08", "*image.Gray", image.Rectangle{}},  // cbG8, filter0  → Gray
+		{"ftp0n2c08", "*image.RGBA", image.Rectangle{}},  // cbTC8, filter0 → RGBA
+		{"ftp0n3p08", "*image.NRGBA", image.Rectangle{}}, // cbP8, filter0  → NRGBA
+		{"ftp1n3p08", "*image.NRGBA", image.Rectangle{}}, // cbP8, filter1  → NRGBA
 		// 16-bit types
-		{"basn0g16", "*image.Gray16"},     // cbG16, no tRNS  → Gray16
-		{"ftbwn0g16", "*image.NRGBA64"},   // cbG16 + tRNS    → NRGBA64
-		{"basn4a16", "*image.NRGBA64"},    // cbGA16           → NRGBA64
-		{"basn2c16", "*image.RGBA64"},     // cbTC16, no tRNS  → RGBA64
-		{"ftbbn2c16", "*image.NRGBA64"},   // cbTC16 + tRNS    → NRGBA64
-		{"basn6a16", "*image.NRGBA64"},    // cbTCA16          → NRGBA64
+		{"basn0g16", "*image.Gray16", image.Rectangle{}},   // cbG16, no tRNS   → Gray16
+		{"ftbwn0g16", "*image.NRGBA64", image.Rectangle{}}, // cbG16 + tRNS     → NRGBA64
+		{"basn4a16", "*image.NRGBA64", image.Rectangle{}},  // cbGA16           → NRGBA64
+		{"basn2c16", "*image.RGBA64", image.Rectangle{}},   // cbTC16, no tRNS  → RGBA64
+		{"ftbbn2c16", "*image.NRGBA64", image.Rectangle{}}, // cbTC16+tRNS (black) → NRGBA64
+		{"ftbgn2c16", "*image.NRGBA64", image.Rectangle{}}, // cbTC16+tRNS (green) → NRGBA64
+		{"basn6a16", "*image.NRGBA64", image.Rectangle{}},  // cbTCA16          → NRGBA64
 		// paletted types
-		{"basn3p01", "*image.NRGBA"},      // cbP1             → NRGBA (shrink path)
-		{"basn3p02", "*image.NRGBA"},      // cbP2             → NRGBA
-		{"basn3p04", "*image.NRGBA"},      // cbP4             → NRGBA
-		{"basn3p08", "*image.NRGBA"},      // cbP8             → NRGBA
-		{"basn3p08-trns", "*image.NRGBA"}, // cbP8 + tRNS      → NRGBA
+		{"basn3p01", "*image.NRGBA", image.Rectangle{}},      // cbP1        → NRGBA
+		{"basn3p02", "*image.NRGBA", image.Rectangle{}},      // cbP2        → NRGBA
+		{"basn3p04", "*image.NRGBA", image.Rectangle{}},      // cbP4        → NRGBA
+		{"basn3p08", "*image.NRGBA", image.Rectangle{}},      // cbP8        → NRGBA
+		{"basn3p08-trns", "*image.NRGBA", image.Rectangle{}}, // cbP8 + tRNS → NRGBA
+		{"ftbbn3p08", "*image.NRGBA", image.Rectangle{}},     // cbP8 + tRNS (black bKGD) → NRGBA
+		{"ftbgn3p08", "*image.NRGBA", image.Rectangle{}},     // cbP8 + tRNS (green bKGD) → NRGBA
+		{"ftbwn3p08", "*image.NRGBA", image.Rectangle{}},     // cbP8 + tRNS (white bKGD) → NRGBA
+		{"ftbyn3p08", "*image.NRGBA", image.Rectangle{}},     // cbP8 + tRNS (yellow bKGD) → NRGBA
+		// interlaced paletted — resize is skipped, returned at original size
+		{"basn3p04-31i", "*image.Paletted", image.Rect(0, 0, 31, 31)}, // cbP4, interlaced → Paletted 31×31
 	}
 	for _, tc := range cases {
 		t.Run(tc.file, func(t *testing.T) {
@@ -49,7 +77,12 @@ func TestShrinkPNGSuiteTypes(t *testing.T) {
 
 			img, err := Decode(f, 16, 16, MitchellNetravali)
 			require.NoError(t, err)
-			require.Equal(t, image.Rect(0, 0, 16, 16), img.Bounds(),
+
+			wantBounds := tc.wantBounds
+			if wantBounds == (image.Rectangle{}) {
+				wantBounds = dstRect
+			}
+			require.Equal(t, wantBounds, img.Bounds(),
 				"unexpected bounds for %s", tc.file)
 			require.Equal(t, tc.wantType, fmt.Sprintf("%T", img),
 				"unexpected image type for %s", tc.file)
@@ -317,6 +350,83 @@ func mustShrink(t *testing.T, src image.Image, dstW, dstH int) image.Image {
 	require.NoError(t, err)
 	require.Equal(t, image.Rect(0, 0, dstW, dstH), img.Bounds())
 	return img
+}
+
+// TestShrinkGolden does a pixel-exact comparison against golden PNG files stored
+// in testdata/golden/. Run with -update to regenerate the golden files.
+//
+//	go test -run TestShrinkGolden -update
+func TestShrinkGolden(t *testing.T) {
+	cases := []string{
+		// sub-byte gray, no tRNS
+		"basn0g01", "basn0g02", "basn0g04",
+		// sub-byte gray with non-standard widths
+		"basn0g01-30", "basn0g02-29", "basn0g04-31",
+		// sub-byte gray + tRNS
+		"ftbbn0g01", "ftbbn0g02", "ftbbn0g04",
+		// 8-bit
+		"basn0g08", "basn2c08", "basn4a08", "basn6a08", "ftbrn2c08",
+		// PNG filter type tests
+		"ftp0n0g08", "ftp0n2c08", "ftp0n3p08", "ftp1n3p08",
+		// 16-bit
+		"basn0g16", "ftbwn0g16", "basn2c16", "ftbbn2c16", "ftbgn2c16", "basn4a16", "basn6a16",
+		// paletted
+		"basn3p01", "basn3p02", "basn3p04", "basn3p08", "basn3p08-trns",
+		"ftbbn3p08", "ftbgn3p08", "ftbwn3p08", "ftbyn3p08",
+	}
+
+	if *update {
+		require.NoError(t, os.MkdirAll("testdata/golden", 0o755))
+	}
+
+	for _, name := range cases {
+		t.Run(name, func(t *testing.T) {
+			f, err := os.Open("testdata/pngsuite/" + name + ".png")
+			require.NoError(t, err)
+			defer f.Close()
+
+			got, err := Decode(f, 16, 16, MitchellNetravali)
+			require.NoError(t, err)
+
+			goldenPath := "testdata/golden/" + name + ".png"
+
+			if *update {
+				out, err := os.Create(goldenPath)
+				require.NoError(t, err)
+				require.NoError(t, png.Encode(out, got))
+				require.NoError(t, out.Close())
+				return
+			}
+
+			gf, err := os.Open(goldenPath)
+			require.NoError(t, err, "golden file missing – run: go test -run TestShrinkGolden -update")
+			defer gf.Close()
+
+			want, err := png.Decode(gf)
+			require.NoError(t, err)
+
+			require.Equal(t, want.Bounds(), got.Bounds(), "bounds mismatch for %s", name)
+			assertImagesEqual(t, name, want, got)
+		})
+	}
+}
+
+// assertImagesEqual compares two images pixel-by-pixel via .RGBA() (premultiplied 16-bit).
+func assertImagesEqual(t *testing.T, name string, want, got image.Image) {
+	t.Helper()
+	b := want.Bounds()
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			wr, wg, wb, wa := want.At(x, y).RGBA()
+			gr, gg, gb, ga := got.At(x, y).RGBA()
+			if wr != gr || wg != gg || wb != gb || wa != ga {
+				t.Fatalf("%s: pixel mismatch at (%d,%d): want RGBA(%d,%d,%d,%d) got RGBA(%d,%d,%d,%d)",
+					name, x, y,
+					wr>>8, wg>>8, wb>>8, wa>>8,
+					gr>>8, gg>>8, gb>>8, ga>>8)
+			}
+		}
+	}
 }
 
 func absDiffU16(a, b uint16) int {
