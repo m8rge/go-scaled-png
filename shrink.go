@@ -3,6 +3,7 @@ package pngscaled
 import (
 	"image"
 	"math"
+	"runtime"
 	"sync"
 )
 
@@ -462,12 +463,35 @@ func verticalRGBAColumnsQ15(pix []byte, stride, width, dstH int, ct *coeffTableQ
 		verticalRGBAColumnsQ15Narrow(pix, stride, width, dstH, ct)
 		return
 	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers > width {
+		workers = width
+	}
+	// Keep tiny images single-threaded to avoid scheduling overhead.
+	if workers <= 1 || width < workers*2 {
+		verticalRGBAColumnsQ15Range(pix, stride, dstH, ct, 0, width)
+		return
+	}
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		xStart := w * width / workers
+		xEnd := (w + 1) * width / workers
+		go func(start, end int) {
+			defer wg.Done()
+			verticalRGBAColumnsQ15Range(pix, stride, dstH, ct, start, end)
+		}(xStart, xEnd)
+	}
+	wg.Wait()
+}
+
+func verticalRGBAColumnsQ15Range(pix []byte, stride, dstH int, ct *coeffTableQ15, xStart, xEnd int) {
 	buf := make([]byte, 4*dstH)
 	left := ct.left
 	off := ct.off
 	cnt := ct.cnt
 	wQ15 := ct.wQ15
-	for x := 0; x < width; x++ {
+	for x := xStart; x < xEnd; x++ {
 		colOffset := 4 * x
 		for yd := 0; yd < dstH; yd++ {
 			rowIdx := int(left[yd])*stride + colOffset

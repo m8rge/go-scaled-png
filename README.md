@@ -57,24 +57,24 @@ Benchmarks for a `3456x2234` source image (16" MBP screen resolution) are in
 `BenchmarkResizeLargePNGScaled` and `BenchmarkResizeLargeStdlibImaging`:
 
 ```bash
-go test -run '^$' -bench 'BenchmarkResizeLarge(PNGScaled|StdlibImaging)' -benchmem -benchtime=1x ./...
+go test -run '^$' -bench 'BenchmarkResizeLarge(PNGScaled|StdlibImaging)' -benchmem -count=5 ./...
 ```
 
 These cover `3456x2234 -> 1920x1080` (Full HD) and `3456x2234 -> 32x32`.
 
-Reference run (`darwin/arm64`, Apple M2, `-benchtime=1x`):
+Reference run (`darwin/arm64`, Apple M2, averages over `-count=5`):
 
 | Benchmark | CPU (ns/op) | Memory (B/op) |
 |---|---:|---:|
-| `BenchmarkResizeLargePNGScaled/3456x2234_to_1920x1080` | `137326959` | `17324864` |
-| `BenchmarkResizeLargePNGScaled/3456x2234_to_32x32` | `58325166` | `401088` |
+| `BenchmarkResizeLargePNGScaled/3456x2234_to_1920x1080` | `75141693` | `17271989` |
+| `BenchmarkResizeLargePNGScaled/3456x2234_to_32x32` | `54016277` | `354519` |
 
 For baseline comparison (`png.Decode` + `imaging.Resize` on the same data):
 
 | Benchmark | CPU (ns/op) | Memory (B/op) |
 |---|---:|---:|
-| `BenchmarkResizeLargeStdlibImaging/3456x2234_to_1920x1080` | `58521250` | `57346112` |
-| `BenchmarkResizeLargeStdlibImaging/3456x2234_to_32x32` | `44936708` | `31836672` |
+| `BenchmarkResizeLargeStdlibImaging/3456x2234_to_1920x1080` | `61325341` | `57329316` |
+| `BenchmarkResizeLargeStdlibImaging/3456x2234_to_32x32` | `45143010` | `31831211` |
 
 The sample visual inspection tool is documented in
 `cmd/shrink-samples/README.md`.
