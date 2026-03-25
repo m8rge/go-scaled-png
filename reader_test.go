@@ -355,7 +355,7 @@ func TestReader(t *testing.T) {
 		piper, pipew := io.Pipe()
 		pb := bufio.NewScanner(piper)
 		go sng(pipew, fn, img)
-		defer piper.Close()
+		t.Cleanup(func() { piper.Close() })
 
 		// Read the .sng file.
 		sf, err := os.Open("testdata/pngsuite/" + fn + ".sng")
@@ -363,7 +363,7 @@ func TestReader(t *testing.T) {
 			t.Error(fn, err)
 			continue
 		}
-		defer sf.Close()
+		t.Cleanup(func() { sf.Close() })
 		sb := bufio.NewScanner(sf)
 
 		// Compare the two, in SNG format, line by line.
@@ -441,7 +441,7 @@ func TestPalettedDecodeConfig(t *testing.T) {
 			t.Errorf("%s: open failed: %v", fn, err)
 			continue
 		}
-		defer f.Close()
+		t.Cleanup(func() { f.Close() })
 		cfg, err := DecodeConfig(f)
 		if err != nil {
 			t.Errorf("%s: %v", fn, err)
@@ -482,7 +482,7 @@ func TestIncompleteIDATOnRowBoundary(t *testing.T) {
 		idat = "\x00\x00\x00\x0eIDAT\x78\x9c\x62\x62\x00\x04\x00\x00\xff\xff\x00\x06\x00\x03\xfa\xd0\x59\xae"
 		iend = "\x00\x00\x00\x00IEND\xae\x42\x60\x82"
 	)
-	_, err := Decode(strings.NewReader(pngHeader+ihdr+idat+iend), 0, 0, Lanczos)
+	_, err := Decode(strings.NewReader(pngHeader+ihdr+idat+iend), 1, 1, Linear)
 	if err == nil {
 		t.Fatal("got nil error, want non-nil")
 	}
@@ -497,7 +497,7 @@ func TestTrailingIDATChunks(t *testing.T) {
 		idatZero  = "\x00\x00\x00\x00IDAT\x35\xaf\x06\x1e"
 		iend      = "\x00\x00\x00\x00IEND\xae\x42\x60\x82"
 	)
-	_, err := Decode(strings.NewReader(pngHeader+ihdr+idatWhite+idatZero+iend), 0, 0, Lanczos)
+	_, err := Decode(strings.NewReader(pngHeader+ihdr+idatWhite+idatZero+iend), 1, 1, Linear)
 	if err != nil {
 		t.Fatalf("decoding valid image: %v", err)
 	}
@@ -506,7 +506,7 @@ func TestTrailingIDATChunks(t *testing.T) {
 	// The following chunk contains a single pixel with color.Gray{0}.
 	const idatBlack = "\x00\x00\x00\x0eIDAT\x78\x9c\x62\x62\x00\x04\x00\x00\xff\xff\x00\x06\x00\x03\xfa\xd0\x59\xae"
 
-	img, err := Decode(strings.NewReader(pngHeader+ihdr+idatWhite+idatBlack+iend), 0, 0, Lanczos)
+	img, err := Decode(strings.NewReader(pngHeader+ihdr+idatWhite+idatBlack+iend), 1, 1, Linear)
 	if err != nil {
 		t.Fatalf("trailing IDAT not ignored: %v", err)
 	}
@@ -547,7 +547,7 @@ func TestMultipletRNSChunks(t *testing.T) {
 		b = append(b, iend...)
 
 		var want color.Color
-		m, err := Decode(bytes.NewReader(b), 0, 0, Lanczos)
+		m, err := Decode(bytes.NewReader(b), 1, 1, Linear)
 		switch i {
 		case 0:
 			if err != nil {
@@ -581,7 +581,7 @@ func TestUnknownChunkLengthUnderflow(t *testing.T) {
 		0x01, 0x00, 0xff, 0xff, 0xff, 0xff, 0x07, 0xf4, 0x7c, 0x55, 0x04, 0x1a,
 		0xd3,
 	}
-	_, err := Decode(bytes.NewReader(data), 0, 0, Lanczos)
+	_, err := Decode(bytes.NewReader(data), 1, 1, Linear)
 	if err == nil {
 		t.Errorf("Didn't fail reading an unknown chunk with length 0xffffffff")
 	}
@@ -618,7 +618,7 @@ func TestGray8Transparent(t *testing.T) {
 		0x92, 0xd7, 0x82, 0x41, 0x31, 0x9c, 0x3f, 0x07, 0x02, 0xee, 0xa1, 0xaa, 0xff, 0xff, 0x9f, 0xe1,
 		0xd9, 0x56, 0x30, 0xf8, 0x0e, 0xe5, 0x03, 0x00, 0xa9, 0x42, 0x84, 0x3d, 0xdf, 0x8f, 0xa6, 0x8f,
 		0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-	}), 0, 0, Lanczos)
+	}), 0, 0, Linear)
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
@@ -853,7 +853,7 @@ func benchmarkDecode(b *testing.B, filename string, bytesPerPixel int) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		Decode(bytes.NewReader(data), 0, 0, Lanczos)
+		Decode(bytes.NewReader(data), 100, 100, Linear)
 	}
 }
 
@@ -880,7 +880,7 @@ func TestDecodeInterlacedResized(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	scaledImg, err := Decode(bytes.NewReader(data), 10, 10, MitchellNetravali)
+	scaledImg, err := Decode(bytes.NewReader(data), 10, 10, Linear)
 	if err != nil {
 		t.Fatalf("failed to decode i.png with pngscaled: %v", err)
 	}
